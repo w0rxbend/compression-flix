@@ -1,0 +1,42 @@
+name: Setup Flix
+description: >
+  Install the Flix compiler as an executable named `flix` on PATH, with the
+  downloaded jar cached between runs.
+
+inputs:
+  version:
+    description: Flix release to install, e.g. 0.75.1
+    required: true
+
+runs:
+  using: composite
+  steps:
+    # The jar is ~40 MB and the release URL is immutable for a given tag, so the
+    # cache key needs no hash beyond the version itself.
+    - name: Cache Flix compiler
+      uses: actions/cache@v4
+      with:
+        path: ${{ runner.temp }}/flix.jar
+        key: flix-${{ inputs.version }}
+
+    - name: Install Flix
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ ! -f "$RUNNER_TEMP/flix.jar" ]; then
+          # Every Flix release publishes exactly one asset, flix.jar.
+          curl -fL -o "$RUNNER_TEMP/flix.jar" \
+            "https://github.com/flix/flix/releases/download/v${{ inputs.version }}/flix.jar"
+        fi
+        # `flix` must exist as an executable on PATH, because that is the literal
+        # command `build.sbt`'s flixJar task shells out to. A shell alias, or a
+        # `java -jar` spelled out in a later step, would not be visible to it.
+        mkdir -p "$HOME/.local/bin"
+        printf '#!/usr/bin/env sh\nexec java -Xmx4G -jar "%s" "$@"\n' "$RUNNER_TEMP/flix.jar" \
+          > "$HOME/.local/bin/flix"
+        chmod +x "$HOME/.local/bin/flix"
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+    - name: Flix version
+      shell: bash
+      run: flix --version

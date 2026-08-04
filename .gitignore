@@ -1,0 +1,9 @@
+.bsp/
+target/
+project/metals.sbt
+project/project/
+
+# Flix build output. `build/` accumulates stale classes across incremental builds
+# and is never pruned, so it is dead weight as well as generated.
+build/
+artifact/

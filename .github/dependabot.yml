@@ -1,0 +1,16 @@
+version: 2
+
+updates:
+  # Keeps the pinned action majors (checkout@v5, setup-java@v5, cache@v4,
+  # upload-artifact@v4, sbt/setup-sbt@v1) from silently rotting. This covers the
+  # composite action in .github/actions/ as well as the workflows.
+  #
+  # Note it does NOT cover the Flix compiler: FLIX_VERSION is a plain env var
+  # pointing at a GitHub release asset, not a dependency Dependabot understands.
+  # Bumping Flix is a manual decision anyway — it changes the emitted bytecode and
+  # needs the differential suite re-run, not just a green build.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
