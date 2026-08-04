@@ -42,6 +42,7 @@ mod BitOps {
     /// shift distance to 5 bits, so `1 << 32 == 1`). That is a lost assertion, not a
     /// silent difference in any encoded byte.
     ///
+    @Inline
     pub def bitMask(i: Int32): Int32 = Bits.shl(1, i) - 1
 
     ///
@@ -55,20 +56,25 @@ mod BitOps {
                 loop(i + 1)
             } else ()
         };
-        loop(0)
+        // Trailing `()`: see the note in `mod Board`. A tail call to another def
+        // (here the lifted `loop`) is compiled to a heap continuation.
+        loop(0);
+        ()
 
     ///
     /// `writeSigned(n: Int, writer)`: zigzag encode, then write as unsigned.
     ///
     /// Small negative and positive numbers both become small positive numbers.
     ///
-    pub def writeSigned(n: Int32, w: BitWriter[r]): Unit \ r =
-        writeUnsigned(Bits.bxor(Bits.shl(n, 1), Bits.shr(n, 31)), w)
+    pub def writeSigned(n: Int32, w: BitWriter[r]): Unit \ r = {
+        writeUnsigned(Bits.bxor(Bits.shl(n, 1), Bits.shr(n, 31)), w);
+        ()
+    }
 
     ///
     /// `writeUnsigned(n: Int, writer)`: 6-bit head, then 4-bit continuation groups.
     ///
-    pub def writeUnsigned(n: Int32, w: BitWriter[r]): Unit \ r =
+    pub def writeUnsigned(n: Int32, w: BitWriter[r]): Unit \ r = {
         if (Bits.band(n, Bits.bnot(0x1f)) == 0)
             BitWriter.writeBits(n, 6, w)
         else {
@@ -77,16 +83,21 @@ mod BitOps {
                 if (Bits.band(remaining, Bits.bnot(0x07)) != 0) {
                     BitWriter.writeBits(Bits.bor(remaining, 0x08), 4, w);
                     loop(Bits.ushr(remaining, 3))
-                } else
+                } else {
                     // Loop terminated, so the 4th bit is 0.
-                    BitWriter.writeBits(remaining, 4, w)
+                    BitWriter.writeBits(remaining, 4, w);
+                    ()   // keeps the call out of tail position; see `mod Board`
+                }
             };
             loop(Bits.ushr(n, 5))
-        }
+        };
+        ()
+    }
 
     ///
     /// `readUnsigned(reader)`: inverse of `writeUnsigned`.
     ///
+    @Inline
     pub def readUnsigned(rd: BitReader[r]): Int32 \ r =
         let n = BitReader.readBits(6, rd);
         if (n > 0x1f) {
@@ -155,6 +166,7 @@ mod BitReader {
     ///
     /// `bb.remaining`.
     ///
+    @Inline
     def remaining(rd: BitReader[r]): Int32 \ r =
         Array.length(rd->bytes) - rd->pos
 
@@ -208,7 +220,8 @@ mod BitReader {
                     loop(s - 8)
                 } else ()
             };
-            loop(numRemainingBits - 16)
+            loop(numRemainingBits - 16);
+            ()   // keeps the lifted `loop` out of tail position; see `mod Board`
         }
 
     ///
@@ -216,6 +229,16 @@ mod BitReader {
     ///
     /// When the request straddles the end of `pendingBits` the call recurses, as in
     /// the original: the low part of the result comes from a fresh word.
+    ///
+    /// Both arms are kept in one body, and that is a MEASURED decision rather than
+    /// an oversight. This def is 295 bytecodes, close to HotSpot's `FreqInlineSize`
+    /// of 325, so splitting the straddle arm out to shrink it looks obviously
+    /// right — it was tried and it made the clock codec *slower*: decode went from
+    /// 1.14-1.33x of the Scala original to 1.30-1.33x, and encode did not move.
+    /// (The first attempt was far worse still, 2.2x, because the extracted call
+    /// landed in tail position and Flix compiled it to a heap continuation; that
+    /// part is fixable with the `; ()` idiom documented above `Board.put`, and even
+    /// once fixed the split did not pay.) Do not re-split this without measuring.
     ///
     pub def readBits(numReqBits: Int32, rd: BitReader[r]): Int32 \ r =
         if (rd->numRemainingBits >= numReqBits) {
@@ -255,6 +278,8 @@ mod BitWriter {
     ///
     /// Append the low `numBits` bits of `data`.
     ///
+    /// Both arms are kept in one body; see the note on `BitReader.readBits` for the
+    /// measurement that says splitting them does not pay.
     pub def writeBits(data: Int32, numBits: Int32, w: BitWriter[r]): Unit \ r =
         let maskedData = Bits.band(data, BitOps.bitMask(numBits));
         w->numRemainingBits = w->numRemainingBits - numBits;
@@ -350,6 +375,7 @@ mod IntArrayList {
         loop(0);
         dst
 
+    @Inline
     pub def add(elt: Int32, l: IntArrayList[r]): Unit \ r =
         // This is the growth strategy used by OpenJDK ArrayList.
         if (l->index == Array.length(l->data))
@@ -359,8 +385,10 @@ mod IntArrayList {
         Array.put(elt, l->index, l->data);
         l->index = l->index + 1
 
+    @Inline
     pub def size(l: IntArrayList[r]): Int32 \ r = l->index
 
+    @Inline
     pub def get(i: Int32, l: IntArrayList[r]): Int32 \ r = Array.get(i, l->data)
 
     ///

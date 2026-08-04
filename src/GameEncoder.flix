@@ -25,7 +25,9 @@
 ///     encoder's `legal.promotion == promotion` test is an `Option` comparison.
 ///   * `charToRole` throws `IllegalArgumentException` on an unexpected char. That
 ///     is unreachable — the only callers pass a character the SAN pattern has
-///     already restricted to `[NBKRQ]` — so it is `bug!` here.
+///     already restricted to `[NBKRQ]` — so it is `bug!` here. It is spelled
+///     `codeToRole` and takes a code point, because that is what the matcher below
+///     hands back.
 ///   * The `ThreadLocal[MoveList]` is just a scratch buffer; here it is a
 ///     `MoveList` allocated in the local region, which is thread-local by
 ///     construction.
@@ -43,12 +45,15 @@
 /// Scala matches with
 /// `"([NBKRQ])?([a-h])?([1-8])?x?([a-h][1-8])(?:=([NBRQK]))?[\\+#]?".r` and
 /// `findFirstMatchIn`. Flix 0.75.1 has no regex group API worth relying on here,
-/// so `sanFind` is a hand-written backtracking matcher for exactly that pattern,
-/// with Java's semantics: leftmost match wins, and at a given start position the
-/// greedy `?` quantifiers are tried *present first* and backtracked in
-/// right-to-left order. `sanMatchAt` is the nested-alternative transcription of
-/// that. The trailing `(?:=...)?` and `[\+#]?` cannot cause failure, so once
-/// group 4 matches the whole match succeeds.
+/// so `sanFind` is a hand-written matcher for exactly that pattern, with Java's
+/// semantics: leftmost match wins, and at a given start position the greedy `?`
+/// quantifiers are tried *present first* and backtracked in right-to-left order.
+/// `findLoop` enumerates `(start position, subset mask)` in exactly that order and
+/// packs the six capture groups into an `Int64`; see the long note on it for why
+/// the enumeration order is the same walk the nested transcription performed, and
+/// for the 679 045-input three-way fuzz against `java.util.regex` that checks it.
+/// The trailing `(?:=...)?` and `[\+#]?` cannot cause failure, so once group 4
+/// matches the whole match succeeds.
 ///
 /// Worked examples that pin the backtracking down:
 ///
@@ -72,7 +77,7 @@
 /// `Tables.mk()` would rebuild 88772 longs on every call. Build once, hold.
 ///
 pub enum GameTables {
-    case GameTables(Tables, Psqt, Vector[Int32], Huffman.HuffmanTable)
+    case GameTables(Tables[Static], Psqt, Vector[Int32], Huffman.HuffmanTable)
 }
 
 mod GameTables {
@@ -84,7 +89,7 @@ mod GameTables {
         GameTables.GameTables(Tables.mk(), Psqt.mk(), ZobristHash.polyglot(), Huffman.mkTable())
 
     /// The `Bitboard` attack tables.
-    pub def tables(gt: GameTables): Tables =
+    pub def tables(gt: GameTables): Tables[Static] =
         let GameTables.GameTables(t, _, _, _) = gt;
         t
 
@@ -145,6 +150,8 @@ mod DecodeResult {
 
 mod GameEncoder {
 
+    import java.lang.Character
+
     // ------------------------------------------------------------------ encode
 
     ///
@@ -187,10 +194,19 @@ mod GameEncoder {
             case None => false
             case Some((role, promotion, fromMask, toSq)) =>
                 Board.legalMoves(board, legals);
+                // The parsed promotion is turned into a code once, so the predicate
+                // compares two `Int32`s instead of building an `Option[Role]` per
+                // candidate move. Same test: the encoding of `Option[Role]` as
+                // `0` / `Role.index + 1` is injective.
+                let roleIndex = Role.index(role);
+                let promotionCode = match promotion {
+                    case None    => 0
+                    case Some(p) => Role.index(p) + 1
+                };
                 let found = MoveList.find(legals, legal ->
-                    Move.role(legal) == role and
+                    Move.roleIndex(legal) == roleIndex and
                     Move.toSq(legal) == toSq and
-                    Move.promotion(legal) == promotion and
+                    Move.promotionCode(legal) == promotionCode and
                     Bitboard.contains(fromMask, Move.fromSq(legal)));
                 match found {
                     case None => false
@@ -228,169 +244,200 @@ mod GameEncoder {
     def parseMove(gt: GameTables, board: Board[r], pgnMove: String
                  ): Option[(Role, Option[Role], Int64, Int32)] \ r = {
         let t = GameTables.tables(gt);
-        if (String.startsWith(prefix = "O-O-O", pgnMove)) {
+        if (hasPrefix(pgnMove, "O-O-O")) {
             let backRank = Bits.bandL(Board.rooks(board), Bitboard.ranks(t, if (Board.turn(board)) 0 else 7));
             Some((Role.King, None, Board.kings(board), Bitboard.lsb(backRank)))
-        } else if (String.startsWith(prefix = "O-O", pgnMove)) {
+        } else if (hasPrefix(pgnMove, "O-O")) {
             let backRank = Bits.bandL(Board.rooks(board), Bitboard.ranks(t, if (Board.turn(board)) 0 else 7));
             Some((Role.King, None, Board.kings(board), Bitboard.msb(backRank)))
-        } else
-            match sanFind(pgnMove) {
-                case None => None
-                case Some((g1, g2, g3, toFile, toRank, g5)) =>
-                    let role = match g1 {
-                        case None    => Role.Pawn
-                        case Some(c) => charToRole(c)
-                    };
-                    let fromFile = match g2 {
-                        case None    => Bitboard.all()
-                        case Some(c) => Bitboard.files(t, Char.toBmpCodePoint(c) - Char.toBmpCodePoint('a'))
-                    };
-                    let fromMask0 = Bits.bandL(Bitboard.all(), fromFile);
-                    let fromMask = match g3 {
-                        case None    => fromMask0
-                        case Some(c) =>
-                            Bits.bandL(fromMask0,
-                                Bitboard.ranks(t, Char.toBmpCodePoint(c) - Char.toBmpCodePoint('1')))
-                    };
-                    let toSq = Square.square(
-                        Char.toBmpCodePoint(toFile) - Char.toBmpCodePoint('a'),
-                        Char.toBmpCodePoint(toRank) - Char.toBmpCodePoint('1'));
-                    let promotion = match g5 {
-                        case None    => None
-                        case Some(c) => Some(charToRole(c))
-                    };
-                    Some((role, promotion, fromMask, toSq))
+        } else {
+            let m = sanFind(pgnMove);
+            if (m == noMatch()) None else {
+                let g1 = group(m, 0);
+                let g2 = group(m, 7);
+                let g3 = group(m, 14);
+                let toFile = group(m, 21);
+                let toRank = group(m, 28);
+                let g5 = group(m, 35);
+                let role = if (g1 == 0) Role.Pawn else codeToRole(g1);
+                let fromFile = if (g2 == 0) Bitboard.all() else Bitboard.files(t, g2 - lowerA());
+                let fromMask0 = Bits.bandL(Bitboard.all(), fromFile);
+                let fromMask =
+                    if (g3 == 0) fromMask0
+                    else Bits.bandL(fromMask0, Bitboard.ranks(t, g3 - digit1()));
+                let toSq = Square.square(toFile - lowerA(), toRank - digit1());
+                let promotion = if (g5 == 0) None else Some(codeToRole(g5));
+                Some((role, promotion, fromMask, toSq))
             }
+        }
     }
 
     ///
-    /// Scala `private def charToRole(c: Char): Role`. The `IllegalArgumentException`
-    /// branch is unreachable: every caller passes a character the SAN pattern has
-    /// already constrained to `[NBKRQ]`.
+    /// Scala `private def charToRole(c: Char): Role`, taking the character as a
+    /// code point because that is what the matcher hands back. The
+    /// `IllegalArgumentException` branch is unreachable for the same reason it is
+    /// in the original: every caller passes a character the SAN pattern has already
+    /// constrained to `[NBKRQ]`.
     ///
-    def charToRole(c: Char): Role = match c {
-        case 'N' => Role.Knight
-        case 'B' => Role.Bishop
-        case 'R' => Role.Rook
-        case 'Q' => Role.Queen
-        case 'K' => Role.King
-        case _   => bug!("Encoder.charToRole: not a role character")
-    }
+    @Inline
+    def codeToRole(c: Int32): Role =
+        if (c == Character.hashCode('N')) Role.Knight
+        else if (c == Character.hashCode('B')) Role.Bishop
+        else if (c == Character.hashCode('R')) Role.Rook
+        else if (c == Character.hashCode('Q')) Role.Queen
+        else if (c == Character.hashCode('K')) Role.King
+        else bug!("Encoder.codeToRole: not a role character")
 
     // -------------------------------------------------------------- SAN regex
 
-    /// `[NBKRQ]` — SAN group 1, and (as `[NBRQK]`) group 5.
-    def isRoleChar(c: Char): Bool =
-        c == 'N' or c == 'B' or c == 'K' or c == 'R' or c == 'Q'
+    ///
+    /// The SAN matcher: `([NBKRQ])?([a-h])?([1-8])?x?([a-h][1-8])(?:=([NBRQK]))?[\\+#]?`
+    /// applied as `java.util.regex.Matcher.find()`, i.e. leftmost match wins.
+    ///
+    /// # Why it is flat and packed
+    ///
+    /// This was six mutually recursive `def`s returning
+    /// `Option[(Option[Char], Option[Char], Option[Char], Char, Char, Option[Char])]`.
+    /// Every level allocated: a `Some` per character examined (`charAt` returned
+    /// `Option[Char]`), a `Value$` per level per attempt, a heap continuation per
+    /// backtrack, and a six-wide `Tuple$` on success — on a function the encoder
+    /// runs once per ply, with backtracking, over eight to fourteen characters.
+    /// It was measured as the largest single allocation site in the port.
+    ///
+    /// The replacement is one self-recursive loop over `(start position, subset
+    /// mask)` returning the six capture groups packed into an `Int64` as six 7-bit
+    /// ASCII codes, with `0` meaning "group absent" — `0` is not a SAN character,
+    /// so there is no ambiguity — and `-1` meaning "no match". Nothing is allocated.
+    ///
+    /// # Why the exploration order is the same
+    ///
+    /// `mask` bit 3 is group 1, bit 2 is group 2, bit 1 is group 3, bit 0 is the
+    /// uncaptured `x?`. The nested matcher tried each optional group present-first
+    /// and abandoned the rightmost group first, which is a depth-first walk whose
+    /// leaves are exactly the masks in *descending* numeric order; counting `mask`
+    /// down from 15 to 0 at each start position reproduces it, and stepping `pos`
+    /// outward reproduces leftmost-match-wins.
+    ///
+    /// That argument is checked rather than asserted. A three-way fuzz compared
+    /// this matcher against a transcription of the nested one AND against
+    /// `java.util.regex` running the Scala original's own pattern
+    /// (`src/main/scala/game/Encoder.scala:11`) over 679 045 inputs: every string
+    /// of length 0..4 over `NBKRQabh18x=+#-O`, every one- and two-character string
+    /// over printable ASCII, 600 000 random strings up to length 10, and twenty real
+    /// SAN tokens with check/mate/promotion decorations. Zero disagreements on all
+    /// three pairings. `difftest`'s `SanFuzzTest` and the byte-level
+    /// `DifferentialTest` are the gates that matter, and both were re-run after this.
+    ///
 
-    /// `[a-h]`.
-    def isFileChar(c: Char): Bool = 'a' <= c and c <= 'h'
+    /// `s.charAt(i)` as a code point, or `0` past either end.
+    ///
+    /// `Character.hashCode` rather than `Char.toBmpCodePoint`: the latter is
+    /// `Short.valueOf(x).intValue()` masked, a boxed conversion, while
+    /// `Character.hashCode` is specified as `(int) c` and is a pure `java.lang`
+    /// static. `String.charAt` is on the compiler's pure-methods whitelist.
+    @Inline
+    def code(s: String, n: Int32, i: Int32): Int32 =
+        if (i < 0 or i >= n) 0 else Character.hashCode(String.charAt(i, s))
 
-    /// `[1-8]`.
-    def isRankChar(c: Char): Bool = '1' <= c and c <= '8'
+    /// `'a'`, `'1'`, `'x'` and `'='` as code points, so the matcher is arithmetic.
+    @Inline
+    def lowerA(): Int32 = Character.hashCode('a')
+    @Inline
+    def digit1(): Int32 = Character.hashCode('1')
 
-    /// `s.charAt(i)`, or `None` past the end.
-    def charAt(s: String, n: Int32, i: Int32): Option[Char] =
-        if (i < 0 or i >= n) None else Some(String.charAt(i, s))
+    /// `[NBKRQ]`, as a code point. Also group 5's `[NBRQK]`, which is the same set.
+    @Inline
+    def isRoleCode(c: Int32): Bool =
+        c == Character.hashCode('N') or c == Character.hashCode('B') or
+        c == Character.hashCode('K') or c == Character.hashCode('R') or
+        c == Character.hashCode('Q')
+
+    /// `[a-h]`, as a code point.
+    @Inline
+    def isFileCode(c: Int32): Bool = lowerA() <= c and c <= Character.hashCode('h')
+
+    /// `[1-8]`, as a code point.
+    @Inline
+    def isRankCode(c: Int32): Bool = digit1() <= c and c <= Character.hashCode('8')
+
+    /// The "no match" sentinel. Distinguishable from every packed match, whose
+    /// top bits are always zero.
+    @Inline
+    def noMatch(): Int64 = -1i64
+
+    /// Capture group `shift` of a packed match, as a code point (`0` if absent).
+    @Inline
+    def group(m: Int64, shift: Int32): Int32 =
+        Bits.toInt(Bits.bandL(Bits.ushrL(m, shift), 0x7fi64))
+
+    /// The six groups as one `Int64`; see `group` for the layout.
+    @Inline
+    def pack(g1: Int32, g2: Int32, g3: Int32, f: Int32, r: Int32, g5: Int32): Int64 =
+        Bits.borL(
+            Bits.borL(Bits.borL(Bits.toLongU(g1), Bits.shlL(Bits.toLongU(g2), 7)),
+                      Bits.borL(Bits.shlL(Bits.toLongU(g3), 14), Bits.shlL(Bits.toLongU(f), 21))),
+            Bits.borL(Bits.shlL(Bits.toLongU(r), 28), Bits.shlL(Bits.toLongU(g5), 35)))
 
     ///
-    /// Java `Matcher.find()`: the leftmost start position at which the pattern
-    /// matches. Group 4 is the only mandatory part and is two characters wide, so
-    /// no match can start later than `length - 2`; scanning to `length` is
-    /// harmless and mirrors the original loop.
+    /// `Matcher.find()`: the packed groups of the leftmost match, or `noMatch()`.
     ///
-    /// Returns `(group1, group2, group3, group4-file, group4-rank, group5)`.
+    /// Group 4 is the only mandatory part and is two characters wide, so no match
+    /// can start later than `length - 2`; scanning to `length` is harmless and
+    /// mirrors the original loop.
     ///
-    def sanFind(s: String): Option[(Option[Char], Option[Char], Option[Char], Char, Char, Option[Char])] =
-        sanFindLoop(s, String.length(s), 0)
+    def sanFind(s: String): Int64 = findLoop(s, String.length(s), 0, 15)
 
-    def sanFindLoop(s: String, n: Int32, i: Int32
-                   ): Option[(Option[Char], Option[Char], Option[Char], Char, Char, Option[Char])] =
-        if (i >= n)
-            None
-        else
-            match sanMatchAt(s, n, i) {
-                case Some(r) => Some(r)
-                case None    => sanFindLoop(s, n, i + 1)
+    /// The `(pos, mask)` walk. Self-recursive on both axes, so Flix compiles it to
+    /// a loop rather than a chain of heap continuations.
+    def findLoop(s: String, n: Int32, pos: Int32, mask: Int32): Int64 =
+        if (pos >= n)
+            noMatch()
+        else if (mask < 0)
+            findLoop(s, n, pos + 1, 15)
+        else {
+            let r = tryMask(s, n, pos, mask);
+            if (r != noMatch()) r else findLoop(s, n, pos, mask - 1)
+        }
+
+    ///
+    /// The pattern anchored at `pos` with exactly the optional groups named by
+    /// `mask` present. Each `present` test is a mask bit, so no character is read
+    /// for a group this attempt has chosen to omit.
+    ///
+    @Inline
+    def tryMask(s: String, n: Int32, pos: Int32, mask: Int32): Int64 = {
+        let has1 = Bits.band(mask, 8) != 0;
+        let has2 = Bits.band(mask, 4) != 0;
+        let has3 = Bits.band(mask, 2) != 0;
+        let hasX = Bits.band(mask, 1) != 0;
+        let g1 = if (has1) code(s, n, pos) else 0;
+        let p1 = if (has1) pos + 1 else pos;
+        if (has1 and not isRoleCode(g1)) noMatch() else {
+            let g2 = if (has2) code(s, n, p1) else 0;
+            let p2 = if (has2) p1 + 1 else p1;
+            if (has2 and not isFileCode(g2)) noMatch() else {
+                let g3 = if (has3) code(s, n, p2) else 0;
+                let p3 = if (has3) p2 + 1 else p2;
+                if (has3 and not isRankCode(g3)) noMatch() else {
+                    let xc = if (hasX) code(s, n, p3) else 0;
+                    let p4 = if (hasX) p3 + 1 else p3;
+                    if (hasX and xc != Character.hashCode('x')) noMatch() else {
+                        let f = code(s, n, p4);
+                        let r = code(s, n, p4 + 1);
+                        if (isFileCode(f) and isRankCode(r)) {
+                            // `(?:=([NBRQK]))?` — greedy, but it can never fail the
+                            // match, so there is no mask bit for it.
+                            let eq = code(s, n, p4 + 2);
+                            let pr = code(s, n, p4 + 3);
+                            let g5 = if (eq == Character.hashCode('=') and isRoleCode(pr)) pr else 0;
+                            pack(g1, g2, g3, f, r, g5)
+                        } else
+                            noMatch()
+                    }
+                }
             }
-
-    ///
-    /// The pattern anchored at `pos`. Each optional group is attempted greedily
-    /// (present first) and abandoned on failure of everything to its right.
-    ///
-    def sanMatchAt(s: String, n: Int32, pos: Int32
-                  ): Option[(Option[Char], Option[Char], Option[Char], Char, Char, Option[Char])] = {
-        let withRole = match charAt(s, n, pos) {
-            case Some(c) if isRoleChar(c) => sanGroup2(s, n, pos + 1, Some(c))
-            case _                        => None
-        };
-        match withRole {
-            case Some(r) => Some(r)
-            case None    => sanGroup2(s, n, pos, None)
         }
     }
-
-    /// `([a-h])?`.
-    def sanGroup2(s: String, n: Int32, pos: Int32, g1: Option[Char]
-                 ): Option[(Option[Char], Option[Char], Option[Char], Char, Char, Option[Char])] = {
-        let withFile = match charAt(s, n, pos) {
-            case Some(c) if isFileChar(c) => sanGroup3(s, n, pos + 1, g1, Some(c))
-            case _                        => None
-        };
-        match withFile {
-            case Some(r) => Some(r)
-            case None    => sanGroup3(s, n, pos, g1, None)
-        }
-    }
-
-    /// `([1-8])?`.
-    def sanGroup3(s: String, n: Int32, pos: Int32, g1: Option[Char], g2: Option[Char]
-                 ): Option[(Option[Char], Option[Char], Option[Char], Char, Char, Option[Char])] = {
-        let withRank = match charAt(s, n, pos) {
-            case Some(c) if isRankChar(c) => sanCapture(s, n, pos + 1, g1, g2, Some(c))
-            case _                        => None
-        };
-        match withRank {
-            case Some(r) => Some(r)
-            case None    => sanCapture(s, n, pos, g1, g2, None)
-        }
-    }
-
-    /// `x?` — not captured.
-    def sanCapture(s: String, n: Int32, pos: Int32, g1: Option[Char], g2: Option[Char], g3: Option[Char]
-                  ): Option[(Option[Char], Option[Char], Option[Char], Char, Char, Option[Char])] = {
-        let withX = match charAt(s, n, pos) {
-            case Some('x') => sanGroup4(s, n, pos + 1, g1, g2, g3)
-            case _         => None
-        };
-        match withX {
-            case Some(r) => Some(r)
-            case None    => sanGroup4(s, n, pos, g1, g2, g3)
-        }
-    }
-
-    ///
-    /// `([a-h][1-8])` — mandatory — followed by the two trailing optional groups,
-    /// neither of which can fail the match.
-    ///
-    def sanGroup4(s: String, n: Int32, pos: Int32, g1: Option[Char], g2: Option[Char], g3: Option[Char]
-                 ): Option[(Option[Char], Option[Char], Option[Char], Char, Char, Option[Char])] =
-        match (charAt(s, n, pos), charAt(s, n, pos + 1)) {
-            case (Some(f), Some(r)) =>
-                if (isFileChar(f) and isRankChar(r))
-                    Some((g1, g2, g3, f, r, sanGroup5(s, n, pos + 2)))
-                else
-                    None
-            case _ => None
-        }
-
-    /// `(?:=([NBRQK]))?`.
-    def sanGroup5(s: String, n: Int32, pos: Int32): Option[Char] =
-        match (charAt(s, n, pos), charAt(s, n, pos + 1)) {
-            case (Some('='), Some(c)) => if (isRoleChar(c)) Some(c) else None
-            case _                    => None
-        }
 
     // ------------------------------------------------------------------ decode
 
@@ -413,7 +460,7 @@ mod GameEncoder {
         setHash(positionHashes, -1, Board.zobristHash(board));
 
         let (lastZeroingPly, lastIrreversiblePly, lastUci) =
-            decodeLoop(gt, rd, board, legals, output, positionHashes, plies, 0, -1, -1, None);
+            decodeLoop(rc, gt, rd, board, legals, output, positionHashes, plies, 0, -1, -1, None);
 
         DecodeResult.DecodeResult(
             Array.toVector(output),
@@ -429,7 +476,7 @@ mod GameEncoder {
     ///
     /// Returns `(lastZeroingPly, lastIrreversiblePly, lastUci)`.
     ///
-    def decodeLoop(gt: GameTables, rd: BitReader[r], board: Board[r], legals: MoveList[r],
+    def decodeLoop(rc: Region[r], gt: GameTables, rd: BitReader[r], board: Board[r], legals: MoveList[r],
                    output: Array[String, r], positionHashes: Array[Int8, r], plies: Int32,
                    i: Int32, lastZeroingPly: Int32, lastIrreversiblePly: Int32,
                    lastUci: Option[String]): (Int32, Int32, Option[String]) \ r =
@@ -447,16 +494,16 @@ mod GameEncoder {
             if (i < plies) {
                 let rank = Huffman.read(GameTables.huffman(gt), rd);
                 let move = MoveList.selectRank(legals, rank);
-                Array.put(san(gt, move, legals), i, output);
+                Array.put(san(rc, gt, move, legals), i, output);
                 Board.play(board, move);
                 let nextZeroing = if (Move.isZeroing(move)) i else lastZeroingPly;
                 let nextIrreversible = if (Move.isIrreversible(move)) i else lastIrreversiblePly;
                 setHash(positionHashes, i, Board.zobristHash(board));
                 let nextUci = if (i + 1 == plies) Some(Move.uci(move)) else lastUci;
-                decodeLoop(gt, rd, board, legals, output, positionHashes, plies,
+                decodeLoop(rc, gt, rd, board, legals, output, positionHashes, plies,
                            i + 1, nextZeroing, nextIrreversible, nextUci)
             } else
-                decodeLoop(gt, rd, board, legals, output, positionHashes, plies,
+                decodeLoop(rc, gt, rd, board, legals, output, positionHashes, plies,
                            i + 1, lastZeroingPly, lastIrreversiblePly, lastUci)
         }
 
@@ -477,38 +524,62 @@ mod GameEncoder {
     /// same file forces the rank digit, and any other competitor forces the file
     /// letter.
     ///
-    def san(gt: GameTables, move: Move, legals: MoveList[r]): String \ r =
+    /// # Why a `StringBuilder` and not interpolation
+    ///
+    /// Flix compiles `"${a}${b}"` to a chain of `java.lang.String.concat`, and a
+    /// `Char` inside an interpolation to `Character.toString`. The interpolated
+    /// version of this function emitted thirteen `concat` sites and five
+    /// `Character.toString` sites, each allocating a `String` **and** a fresh
+    /// `byte[]` — and it built the final six-part result out of already-concatenated
+    /// intermediates, so a disambiguated non-pawn move cost roughly 480 bytes where
+    /// the Scala original's single `StringBuilder` costs 80-100.
+    ///
+    /// This produces the identical characters; `difftest` compares the decoded SAN
+    /// token array against the Scala original over the whole corpus.
+    ///
+    /// `StringBuilder.appendCodePoint` takes an `Int32` and appends it directly.
+    /// `StringBuilder.append` would go through `ToString`, which allocates a
+    /// one-character `String` per call — exactly what this is removing.
+    def san(rc: Region[r], gt: GameTables, move: Move, legals: MoveList[r]): String \ r =
         if (Move.moveType(move) == Move.castling())
             if (Move.fromSq(move) < Move.toSq(move)) "O-O" else "O-O-O"
         else if (Move.moveType(move) == Move.normal() or Move.moveType(move) == Move.enPassant()) {
             let t = GameTables.tables(gt);
             let fromSq = Move.fromSq(move);
             let toSq = Move.toSq(move);
-            let disambiguation =
-                if (Move.role(move) != Role.Pawn) {
-                    let others = othersLoop(move, legals, 0, 0i64);
-                    let (file, rank) =
-                        if (others != 0i64) {
-                            let f0 = Bits.bandL(others, Bitboard.ranks(t, Square.rank(fromSq))) != 0i64;
-                            if (Bits.bandL(others, Bitboard.files(t, Square.file(fromSq))) != 0i64)
-                                (f0, true)
-                            else
-                                (true, false)
-                        } else
-                            (false, false);
-                    let fileStr = if (file) "${fileChar(fromSq)}" else "";
-                    let rankStr = if (rank) "${rankChar(fromSq)}" else "";
-                    "${fileStr}${rankStr}"
-                } else if (Move.capture(move))
-                    "${fileChar(fromSq)}"
-                else
-                    "";
-            let captureStr = if (Move.capture(move)) "x" else "";
-            let promotionStr = match Move.promotion(move) {
-                case None    => ""
-                case Some(p) => "=${Role.symbol(p)}"
-            };
-            "${Role.symbol(Move.role(move))}${disambiguation}${captureStr}${fileChar(toSq)}${rankChar(toSq)}${promotionStr}"
+            let sb = StringBuilder.empty(rc);
+
+            StringBuilder.appendString(Role.symbol(Move.role(move)), sb);
+
+            if (Move.roleIndex(move) != Role.index(Role.Pawn)) {
+                let others = othersLoop(move, legals, 0, 0i64);
+                if (others != 0i64) {
+                    // The Scala block above, with the two flags named rather than
+                    // carried in a tuple: `rank` is exactly "a competitor shares
+                    // the file", and `file` is "a competitor shares the rank, or
+                    // there is a competitor that shares neither".
+                    let sameRank = Bits.bandL(others, Bitboard.ranks(t, Square.rank(fromSq))) != 0i64;
+                    let sameFile = Bits.bandL(others, Bitboard.files(t, Square.file(fromSq))) != 0i64;
+                    let file = if (sameFile) sameRank else true;
+                    if (file) StringBuilder.appendCodePoint(fileCode(fromSq), sb) else ();
+                    if (sameFile) StringBuilder.appendCodePoint(rankCode(fromSq), sb) else ()
+                } else ()
+            } else if (Move.capture(move))
+                StringBuilder.appendCodePoint(fileCode(fromSq), sb)
+            else
+                ();
+
+            if (Move.capture(move)) StringBuilder.appendString("x", sb) else ();
+            StringBuilder.appendCodePoint(fileCode(toSq), sb);
+            StringBuilder.appendCodePoint(rankCode(toSq), sb);
+
+            let promotionCode = Move.promotionCode(move);
+            if (promotionCode != 0) {
+                StringBuilder.appendString("=", sb);
+                StringBuilder.appendString(Role.symbol(Role.ofIndex(promotionCode - 1)), sb)
+            } else ();
+
+            StringBuilder.toString(sb)
         } else
             "--"
 
@@ -522,7 +593,7 @@ mod GameEncoder {
         else {
             let other = MoveList.get(legals, i);
             let next =
-                if (Move.role(other) == Move.role(move) and
+                if (Move.roleIndex(other) == Move.roleIndex(move) and
                     Move.toSq(other) == Move.toSq(move) and
                     Move.fromSq(other) != Move.fromSq(move))
                     Bits.borL(acc, Bits.bit(Move.fromSq(other)))
@@ -531,13 +602,35 @@ mod GameEncoder {
             othersLoop(move, legals, i + 1, next)
         }
 
-    /// `(Square.file(sq) + 'a').toChar`.
-    def fileChar(sq: Int32): Char =
-        Int32.truncateToChar(Square.file(sq) + Char.toBmpCodePoint('a'))
+    ///
+    /// `s.startsWith(p)`, without the named-argument record.
+    ///
+    /// `String.startsWith(prefix = p, s)` takes a `{prefix = String}` record, which
+    /// Flix compiles to a heap `RecordExtend$Obj` plus a string-keyed field lookup
+    /// plus a trampolined call — twice per encoded ply, unconditionally. The
+    /// standard library's own body is `s.startsWith(prefix#prefix)` inside a *pure*
+    /// def, which is the proof that `java.lang.String` instance methods need no
+    /// `unsafe` here.
+    ///
+    @Inline
+    def hasPrefix(s: String, p: String): Bool = s.startsWith(p)
 
-    /// `(Square.rank(sq) + '1').toChar`.
-    def rankChar(sq: Int32): Char =
-        Int32.truncateToChar(Square.rank(sq) + Char.toBmpCodePoint('1'))
+    ///
+    /// `Square.file(sq) + 'a'`, as a code point for `StringBuilder.appendCodePoint`.
+    ///
+    /// `Character.hashCode(c)` rather than `Char.toBmpCodePoint(c)`: the latter is
+    /// `Short.valueOf(x).intValue()` masked with `0xFFFF`, a boxed conversion,
+    /// while `Character.hashCode` is specified as `(int) c` and is a pure
+    /// `java.lang` static. Checked equal on all 65536 char values.
+    ///
+    @Inline
+    def fileCode(sq: Int32): Int32 =
+        Square.file(sq) + Character.hashCode('a')
+
+    /// `Square.rank(sq) + '1'`, as a code point.
+    @Inline
+    def rankCode(sq: Int32): Int32 =
+        Square.rank(sq) + Character.hashCode('1')
 
     ///
     /// Scala `private def setHash(buffer: Array[Byte], ply: Int, hash: Int): Unit`.

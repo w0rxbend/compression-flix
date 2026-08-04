@@ -41,6 +41,7 @@ mod Square {
     /// Scala: `def square(file: Int, rank: Int): Int = file ^ (rank << 3)`.
     /// Note it is `^`, not `|` — identical for in-range inputs, but kept exact.
     ///
+    @Inline
     pub def square(file: Int32, rank: Int32): Int32 =
         Bits.bxor(file, Bits.shl(rank, 3))
 
@@ -49,6 +50,7 @@ mod Square {
     ///
     /// Scala: `square & 7`.
     ///
+    @Inline
     pub def file(sq: Int32): Int32 = Bits.band(sq, 7)
 
     ///
@@ -56,6 +58,7 @@ mod Square {
     ///
     /// Scala: `square >>> 3` — the logical shift, so it is `Bits.ushr`.
     ///
+    @Inline
     pub def rank(sq: Int32): Int32 = Bits.ushr(sq, 3)
 
     ///
@@ -63,11 +66,13 @@ mod Square {
     ///
     /// Scala: `square ^ 0x38`.
     ///
+    @Inline
     pub def mirror(sq: Int32): Int32 = Bits.bxor(sq, 0x38)
 
     ///
     /// The square with the file of `a` and the rank of `b`.
     ///
+    @Inline
     pub def combine(a: Int32, b: Int32): Int32 = square(file(a), rank(b))
 
     ///
@@ -77,6 +82,7 @@ mod Square {
     /// `abs` is spelled out rather than taken from the stdlib so that the
     /// two's-complement behaviour is Java's `Math.abs`, not a saturating variant.
     ///
+    @Inline
     pub def distance(a: Int32, b: Int32): Int32 = {
         let df = Bits.absInt(file(a) - file(b));
         let dr = Bits.absInt(rank(a) - rank(b));

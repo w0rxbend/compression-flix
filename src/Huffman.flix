@@ -66,16 +66,21 @@ mod Huffman {
     ///
     /// `write(value, writer)`: emit the code for `value` in `CODES`.
     ///
-    pub def write(t: HuffmanTable, value: Int32, w: BitWriter[r]): Unit \ r =
+    pub def write(t: HuffmanTable, value: Int32, w: BitWriter[r]): Unit \ r = {
         match t {
             case HuffmanTable.HuffmanTable(cs, _) => match Vector.get(value, cs) {
                 case Symbol.Symbol(code, bits) => BitWriter.writeBits(code, bits, w)
             }
-        }
+        };
+        // Trailing `()`: see the note in `mod Board`. A tail call to another def
+        // is compiled to a heap continuation dispatched through `Thunk$.invoke()`.
+        ()
+    }
 
     ///
     /// `read(reader)`: walk the decoding tree one bit at a time until a leaf.
     ///
+    @Inline
     pub def read(t: HuffmanTable, rd: BitReader[r]): Int32 \ r =
         match t {
             case HuffmanTable.HuffmanTable(_, root) => traverse(root, rd)

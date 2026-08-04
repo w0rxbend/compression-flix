@@ -14,10 +14,11 @@
 /// its slot (`Encoder.decode` keeps `move` across `board.play(move)`) is safe
 /// only because `legalMoves` is not called in between.
 ///
-/// So **the pooling is dropped**. `Move` is an immutable value (see `Move.flix`),
-/// the buffer is an `Array[Move, r]` of plain values, and `push` writes a freshly
-/// built `Move` into slot `size`. Everything that *is* semantic is preserved
-/// exactly:
+/// So **the pooling is dropped**, and it costs nothing to drop: `Move` is a packed
+/// `Int64` (see `Move.flix`), so `Array[Move, r]` is a bare `long[]` and `push`
+/// stores a value, not a reference to a heap object. The original pools because
+/// its `Move` is a seven-field class; there is no object here to pool.
+/// Everything that *is* semantic is preserved exactly:
 ///
 ///   * ordering is by score **descending** (`Move.lessThan`, from Scala's
 ///     `Integer.compare(that.score, score)`);
@@ -117,6 +118,7 @@ mod MoveList {
     /// `0 .. 255` — and closing it would mean adding a branch for a case
     /// neither implementation can reach.
     ///
+    @Inline
     pub def get(ml: MoveList[r], i: Int32): Move \ r =
         if (i < 0 or i >= ml->size) unsafe IO { throw new IllegalArgumentException("requirement failed") }
         else at(ml, i)
@@ -125,12 +127,14 @@ mod MoveList {
     /// An unchecked slot read, for the internals that are already bounded by
     /// `size` (Scala's `partition` indexes `buffer` directly, bypassing `get`).
     ///
+    @Inline
     def at(ml: MoveList[r], i: Int32): Move \ r =
         Array.get(i, ml->buffer)
 
     ///
     /// Scala `def isEmpty: Boolean = size == 0`.
     ///
+    @Inline
     pub def isEmpty(ml: MoveList[r]): Bool \ r =
         ml->size == 0
 
@@ -138,6 +142,7 @@ mod MoveList {
     /// Appends `m`. This is the shape all four Scala `pushX` methods share:
     /// `buffer(size).set(...)` followed by `size += 1`.
     ///
+    @Inline
     pub def push(ml: MoveList[r], m: Move): Unit \ r = {
         Array.put(m, ml->size, ml->buffer);
         ml->size = ml->size + 1
@@ -146,6 +151,7 @@ mod MoveList {
     ///
     /// Scala `pushNormal(board, role, from, capture, to)`.
     ///
+    @Inline
     pub def pushNormal(ml: MoveList[r], ctx: MoveCtx, role: Role, fromSq: Int32,
                        capture: Bool, toSq: Int32): Unit \ r =
         push(ml, Move.mk(ctx, Move.normal(), role, fromSq, capture, toSq, None))
@@ -156,6 +162,7 @@ mod MoveList {
     /// Note the type is `NORMAL`, not something promotion-specific: that is what
     /// the original says.
     ///
+    @Inline
     pub def pushPromotion(ml: MoveList[r], ctx: MoveCtx, fromSq: Int32, capture: Bool,
                           toSq: Int32, promotion: Role): Unit \ r =
         push(ml, Move.mk(ctx, Move.normal(), Role.Pawn, fromSq, capture, toSq, Some(promotion)))
@@ -164,12 +171,14 @@ mod MoveList {
     /// Scala `pushCastle(board, king, rook)`: `to` is the **rook** square, and
     /// `capture` is false even though the rook square is occupied.
     ///
+    @Inline
     pub def pushCastle(ml: MoveList[r], ctx: MoveCtx, king: Int32, rook: Int32): Unit \ r =
         push(ml, Move.mk(ctx, Move.castling(), Role.King, king, false, rook, None))
 
     ///
     /// Scala `pushEnPassant(board, capturer, to)`: `capture` is true.
     ///
+    @Inline
     pub def pushEnPassant(ml: MoveList[r], ctx: MoveCtx, capturer: Int32, toSq: Int32): Unit \ r =
         push(ml, Move.mk(ctx, Move.enPassant(), Role.Pawn, capturer, true, toSq, None))
 
@@ -245,7 +254,10 @@ mod MoveList {
     ///
     def swapRemove(ml: MoveList[r], i: Int32): Unit \ r = {
         ml->size = ml->size - 1;
-        swap(ml, i, ml->size)
+        // The trailing `()` keeps `swap` out of tail position; see the note in
+        // `mod Board`. A tail call to another def allocates a heap continuation.
+        swap(ml, i, ml->size);
+        ()
     }
 
     ///
@@ -253,6 +265,7 @@ mod MoveList {
     /// and the quickselect's `partition` are written in terms of. Both live in
     /// this module, so this stays private, as in the original.
     ///
+    @Inline
     def swap(ml: MoveList[r], i: Int32, j: Int32): Unit \ r = {
         let tmp = Array.get(i, ml->buffer);
         Array.put(Array.get(j, ml->buffer), i, ml->buffer);
@@ -280,6 +293,7 @@ mod MoveList {
     /// `bug!`. This is the site a corrupt stream actually reaches: a Huffman
     /// symbol larger than the number of legal moves in the position.
     ///
+    @Inline
     pub def selectRank(ml: MoveList[r], targetRank: Int32): Move \ r =
         if (targetRank < 0 or targetRank >= ml->size)
             unsafe IO { throw new IllegalArgumentException("requirement failed") }

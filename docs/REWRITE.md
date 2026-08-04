@@ -683,13 +683,18 @@ Wall clock, each run alone on the box (16 cores; both drivers are single-threade
 
 | | sweep proper | end to end |
 |---|---:|---:|
-| Flix (`perft-sweep.sh`) | **494 s** | 535 s (incl. `flix build-jar`) |
-| Scala (`perft-sweep.sh --scala`) | **161 s** | 176 s (incl. sbt start + compile) |
+| Flix (`perft-sweep.sh`) | **79 s** | 104 s (incl. `flix build-jar`) |
+| Scala (`perft-sweep.sh --scala`) | **160.5 s** | 176 s (incl. sbt start + compile) |
 
-Those two rows were re-measured independently for this revision, from a wiped
-`flix/build` and `flix/artifact`, each run alone. The earlier pass reported 497 s
-and 162 s for the same two figures — agreement to within 1%, which is what makes
-the 3.1× gap a signal rather than noise.
+**The Flix sweep is 2.03× faster than the Scala one** over identical work and an
+identical move-order-sensitive checksum.
+
+Before the optimisation campaign of §5.8 this table read **494 s against 161 s**,
+i.e. 3.07× the other way. Both figures were measured on this machine with this
+script; the Scala row reproduced its 161 s at 160.5 s in the same session as the
+79 s, which is the control that says the Flix change is the code and not the box.
+An earlier pass reported 497 s and 162 s for the pre-campaign figures — agreement
+to within 1%.
 
 Both scripts print their own sweep-proper figure (`[perft] … wall … s`), so this is
 re-measurable rather than quoted. The **3.1x gap is a real signal and not an
@@ -1172,6 +1177,12 @@ minutes because it is 4 135 458 706 nodes. Measured on this box, each run alone:
 **494 s in Flix against 161 s in Scala** for identical work — see §4.3, which is
 where those two numbers are produced by a committed script.
 
+> Both halves of that sentence have since been overtaken. §5.8's campaign took the
+> Flix sweep to **79 s** against the same 160.5 s of Scala, i.e. 2.03× *faster*,
+> and it did so by attacking the calling convention and the data representation —
+> never region allocation, which this paragraph was already right to dismiss.
+> §4.3 carries the current figures.
+
 > An earlier revision of this section said "8m39s against 5m10s". Neither figure is
 > reproducible here and the second is not even close: the Scala sweep is 161 s, not
 > 310 s. Those numbers came from a review pass in which the two sweeps were run
@@ -1204,14 +1215,27 @@ revision; only the percentages attached to them are unreproduced:
 
 - **The calling convention.** Flix boxes through `Value$` and drives calls through
   a `Thunk$`/`Suspension$` trampoline; that accounted for 52% of allocation samples
-  against 1.4% for the `Board`. There is no source-level lever for it (see
+  against 1.4% for the `Board`. There is no *compiler flag* for it (see
   PORTING-NOTES: `flix --help`'s `--X` options are compiler diagnostics only — no
   `-O`, no inliner threshold, no way to turn the trampoline off).
+
+  > **"There is no source-level lever for it" — WRONG, and this was the campaign's
+  > single most valuable correction.** There are two, and together they are most of
+  > §5.8's win. A call to a *different* def in **tail position** is compiled to a
+  > heap continuation dispatched through a megamorphic `invokeinterface`; a trailing
+  > `; ()` moves it out of tail position and it becomes a bare `invokestatic`, which
+  > was worth **2.1× on the clock codec** on its own. And `@Inline` on a small def
+  > deletes both its `Value$` box and its trampoline entry outright. The trampoline
+  > cannot be turned off globally, but it can be kept out of every hot path, and
+  > that is what took this port past the original. PORTING-NOTES has both mechanisms
+  > with the disassembly.
 - **`Int64.numberOfTrailingZeros`.** 14% of execution samples. Mechanism
   re-verified at `Int64.flix:265`: it delegates to `lowestOneBitPosition` (`:206`),
   which delegates to `oneBitPositionHelper` (`:215`) — a **linear scan that tests
   one bit at a time** via `getBit`. Java's is a single `TZCNT`. `Bitboard.lsb` is
-  the hottest function in the port and this is why.
+  the hottest function in the port and this is why. *(Confirmed by §5.8: replacing
+  it was the largest single win of the campaign, worth roughly 1.25× on the game
+  codec by itself.)*
 - **`Int64.logicalRightShift`.** Mechanism re-verified at `Int64.flix:138`: the
   signature really is `logicalRightShift(dist: {dist = Int32}, x: Int64)` — the
   shift distance arrives as a **record**, on a function called once per ray step.
@@ -1235,6 +1259,13 @@ Delete the jar to force a full rebuild.
 
 ### 5.7 Measured cost of the port
 
+> **Superseded by §5.8.** This section records the port *as first written*, before
+> the optimisation campaign. Its figures are the starting point that §5.8 measures
+> against, not the current state: game encode is now **faster** than the original
+> and the worst remaining row is 1.35x rather than 5.3x. The section is kept intact
+> because §5.8's before/after columns are meaningless without it, and because its
+> analysis of *where* the cost came from is what the campaign then acted on.
+
 The first measurement of the Flix port against the original. Full tables, commands,
 toolchain and caveats are in `benchmarks/results.md`; this is the summary.
 
@@ -1242,13 +1273,13 @@ Both implementations are measured **in the same JVM, in the same run, on the sam
 inputs**, with a byte-equality `require` in `@Setup` so that a fork which returns a
 wrong answer dies rather than publishing a fast number.
 
-| operation | Flix / Scala, wall time | Flix / Scala, bytes allocated |
-|---|---:|---:|
-| game encode | **4.9-5.3×** | **24.6-26.4×** |
-| game decode | **4.6-5.3×** | **83.7-90.0×** |
-| clock encode | **4.2-4.3×** | 10.1× |
-| clock decode | **2.7-3.9×** | 26.0× |
-| first encode in a cold JVM | 107.598 ms vs 67.409 ms (**1.60×**, +40 ms) | 1 318 099 B vs 41 085 B |
+| operation | Flix / Scala, wall time | Flix / Scala, bytes allocated | after §5.8 |
+|---|---:|---:|---:|
+| game encode | **4.9-5.3×** | **24.6-26.4×** | **0.82-0.88×** / **0.34-0.47×** |
+| game decode | **4.6-5.3×** | **83.7-90.0×** | 1.02-1.11× / 2.30-3.11× |
+| clock encode | **4.2-4.3×** | 10.1× | 1.27-1.35× / 1.28-1.53× |
+| clock decode | **2.7-3.9×** | 26.0× | 1.15-1.31× / 1.45-3.33× |
+| first encode in a cold JVM | 107.598 ms vs 67.409 ms (**1.60×**, +40 ms) | 1 318 099 B vs 41 085 B | 76.2 ms vs 68.6 ms (1.11×) |
 
 The ratios are flat across three length bands, so this is a constant factor on the
 per-ply work rather than an overhead that amortises over longer games.
@@ -1300,54 +1331,158 @@ apart in one JVM under one JIT and one blackhole mode.
   a cost rather than dressed up as a trade-off. What the port buys is elsewhere —
   no `ThreadLocal`, no shared mutable state, and a compiler that enforces both.
 
-### 5.8 Optimisations measured and deliberately **not** applied
+### 5.8 The optimisation campaign — what was applied, what it bought, what was reverted
 
-Three of these were measured during the profiling pass behind §5.5. **None was
-applied in this round**, on purpose: applying any of them would have meant §5.7
-measured something other than the port as it stands, and an unmeasured port with a
-faster `lsb` is not an improvement on a measured one. They are recorded here with
-their evidence so that whoever does apply them knows what to expect and what to
-re-check.
+**This section used to list three optimisations as "measured and deliberately not
+applied". They have now been applied, along with a dozen more.** The numbers below
+are from `benchmarks/run-optimised/`, produced by
+`bash scripts/run-benchmarks.sh` and derived from JMH's own JSON by
+`python3 scripts/compare-benchmarks.py benchmarks/run-hw benchmarks/run-optimised`.
+Unlike the estimates this section used to carry, every figure here is reproducible
+from the repository.
 
-> **Read the percentages in (a) and (b) as sizing estimates, not results.** Like
-> §5.5's profiling tables they come from a pass whose harness was not committed, and
-> they were **not** reproduced for this revision — there is no command in this
-> repository that produces them. What is solid about all three items is the
-> *mechanism* (readable in the Flix standard library, see §5.5) and the *gating
-> advice* for applying them. What is not solid is any specific number.
+#### The result
 
-**(a) Rewrite `Bitboard.lsb`'s trailing-zero count as a six-mask `ntz`.**
-About 15 lines in one file, no signature change. `Int64.numberOfTrailingZeros` is
-a linear per-bit scan (§5.5); the classic six-mask branchless form replaces it.
-Reported as verified against the standard library's result on 75 adversarial inputs
-and byte-exact over the full 4 135 458 706-node sweep, and worth about **−19.8%**
-on that sweep. Neither the patch nor its harness is in the repository, so that
-figure is an estimate (see the note above). It is the cheapest large win available
-and the obvious next step; `scripts/perft-sweep.sh` is the ready-made before/after
-measurement for whoever does it.
+| axis | before | after |
+|---|---:|---:|
+| game encode, three bands | 5.08-5.30x slower | **0.82-0.88x — faster than Scala** |
+| game encode allocation | 24.6-26.9x | **0.34-0.47x — below Scala** |
+| perft depth-4, 4 135 458 706 nodes | 494 s vs 161 s (3.07x slower) | **79 s vs 160.5 s — 2.03x faster** |
+| game decode | 4.72-5.38x slower | 1.02-1.11x slower |
+| clock encode | 4.24-4.43x slower | 1.27-1.35x slower |
+| clock decode | 2.75-3.98x slower | 1.15-1.31x slower |
+| game decode allocation | 78.9-94.9x | 2.30-3.11x |
+| cold start | 172.3 ms vs 69.1 ms | 76.2 ms vs 68.6 ms |
 
-**(b) `@Inline` on short leaf `def`s in `Bits`, `Square`, `Role`, `Move` and
-`MoveList`.** About **1.35-1.4×** on `perft(5)`, with `flix test` still green and
-identical node counts. One caveat that costs an afternoon if you do not know it:
-`@Inline` can push a method past the JVM's 64 KB limit, and **`flix check` does not
-catch it** — the backend `MethodTooLargeException` surfaces at build time and names
-a *test* file rather than the file you annotated. (PORTING-NOTES has this under
-"`flix check` does not catch the JVM 64 KB method limit".)
+**The target was to beat the Scala original. Game encode and move generation beat
+it; game decode and both clock directions do not.** Nine of the twelve throughput
+rows are still on the slow side of parity; the three that are not are game encode.
+Full tables, caveats and the machine-did-not-move control are in
+`benchmarks/results.md`.
 
-**(c) Pack `Move` into a single `Int64`.** The largest remaining prize and
-**entirely unmeasured**. It is also the one with real fidelity risk: `Move.compare`
-feeds `MoveList.rank`, which decides the Huffman rank that is *actually written to
-the stream*. A representation change that perturbs the ordering changes the encoded
-bytes. So this must be gated on the full differential suite — `sbt difftest/test`,
-which compares emitted bytes — and **never** on perft node counts, which are
-completely insensitive to move ordering and would happily stay green while the
-format broke.
+Every change was gated on `sbt difftest/test` — **emitted bytes**, not node counts —
+and on `flix test`. Both were re-run after every individual change and again at the
+end: 25 examples / 0 failures, and 122 passed / 0 failed / 4 skipped.
 
-The figures in (a) and (b) come from the same profiling pass as §5.5's tables and,
-like those, are **not** reproducible from this repository — no committed benchmark
-produces them. Treat them as sizing estimates, and re-measure before believing a
-specific percentage.
+#### What was applied
 
+Ordered by measured effect, largest first.
+
+**1. `Bitboard.lsb`/`msb` call `java.lang.Long.numberOfTrailingZeros` /
+`numberOfLeadingZeros`.** This is item (a) below, and the six-mask rewrite it
+proposed turned out to be unnecessary: Flix treats every method on
+`java.lang.Long` as **pure**, so the JVM intrinsic can be called directly with no
+`unsafe` block, no effect and no signature change. It is literally the call
+`src/main/scala/game/Bitboard.scala:100` makes, so the two implementations are now
+identical by construction. Measured alone: game encode 5.42/5.30/5.05x ->
+4.30/3.89/3.59x. The single largest win of the campaign.
+
+**2. The tail-call thunk removed from ~20 hot defs.** Flix compiles a call to a
+*different* def in tail position into a heap continuation which the caller's
+trampoline dispatches through a megamorphic `invokeinterface Thunk$.invoke()`.
+A trailing `; ()` on a `Unit`-returning def moves the call out of tail position
+and it becomes a plain `invokestatic`. This is the least intuitive item in the
+campaign and the second largest: clock encode 3.96/4.03/4.26x -> 1.32/1.30/1.22x.
+It is load-bearing in six files, documented at length above `Board.put`, and it
+looks exactly like dead code — see PORTING-NOTES.
+
+**3. `Tables` became a `struct`; `Move` and `Psqt` became a packed `Int64` and a
+`type alias`.** A single-case enum destructure materialises **every** field
+regardless of `_` wildcards and appends a dead `MatchError$` branch, so one read of
+the 15-field `Tables` enum cost 264 bytecodes. As a struct it is a `getfield`.
+`Move` packed into an `Int64` (item (c) below) made `MoveList.buffer` a bare
+`long[]` and deleted the last per-move heap object. Together: game encode
+2.17/2.08/2.30x -> 1.32/1.30/1.31x.
+
+**4. The SAN matcher rewritten flat and allocation-free.** Six mutually recursive
+defs returning `Option[(Option[Char], ..., Char, Char, Option[Char])]` became one
+self-recursive loop over `(start position, 4-bit subset mask)` returning the six
+capture groups packed into an `Int64`. This is where game encode passed Scala:
+0.99/1.00/1.07x -> 0.82/0.86/0.93x, and encode allocation fell to below the
+original's. It is the one change with real fidelity risk, and it is checked by a
+three-way fuzz against a transcription of the old matcher **and against
+`java.util.regex` running the Scala original's own pattern** over 679 045 inputs,
+plus the committed `SanFuzzTest`.
+
+**5. `Bits.ushr`/`ushrL` made branchless.** The standard library's formula branches
+on the sign of the operand, and the JVM has no `>>>` for a conditionally signed
+value, so the branch survives into machine code — inside the magic-bitboard lookup,
+where the operand is a hash and the branch mispredicts about half the time. The
+replacement is `(x >> n) & ~((-1 << (63 - n)) << 1)`, checked against the previous
+body and against `java.lang.Long.divideUnsigned` over millions of comparisons. It
+took `Board.attacksToOcc` from 430 to 306 bytecodes and `Board.isSafe` from 475 to
+323, both crossing under HotSpot's 325-byte `FreqInlineSize`.
+
+**6. ~124 `@Inline` annotations, and the boxing conversions.** Flix has no
+primitive narrowing operation at all, so its conversions box through `java.lang`:
+`Int64.truncateToInt32` is `Long.valueOf(x).intValue()`, `Int8.toInt32` is
+`Byte.valueOf(b).intValue()`, `Int32.truncateToInt8` is
+`Integer.valueOf(x).byteValue()`. The first two have pure `java.lang` replacements
+(`Long.hashCode` on a masked value, `Byte.toUnsignedInt`); the third does not, but
+its argument can be forced into `Integer`'s cache so the `valueOf` never allocates.
+Also: `String.startsWith(prefix = ...)` and `Int32.logicalRightShift(dist = ...)`
+take **records**, which are a heap allocation plus a string-keyed lookup per call.
+
+#### What was tried, measured, and reverted
+
+These are recorded because the reasoning behind each was sound and someone will
+otherwise re-derive it. Both are documented at their sites in the source.
+
+**Splitting `BitReader.readBits` / `BitWriter.writeBits` into fast and slow paths.**
+Both sit near HotSpot's 325-byte inlining threshold, so shrinking them looks
+obviously right. The first attempt made the clock codec **2.1x slower**, because
+the extracted call landed in tail position and became a heap continuation — which
+is the first hard number anyone has put on mechanism 2 above. With the thunk fixed
+the regression disappeared but the split still bought nothing: clock decode median
+regressed 10% with tight error bars. Reverted in full.
+
+**Short-circuiting `Board.isAttacked`.** Three call sites only test `!= 0`, and by
+distributivity the five attack terms can be evaluated cheapest-first and abandoned
+at the first hit — genuinely less work than the Scala original, which always
+evaluates all five. It measured as nothing, and forty lines restating
+`attacksToOcc` in a reference implementation is not worth an unmeasurable gain.
+
+**`@Inline` on the fifteen `Tables` accessors, while `Tables` was still an enum.**
+This is the hazard item (b) warns about, and it fired exactly as advertised:
+`flix check` clean, `flix build-jar` dead with
+`MethodTooLargeException: TestBitboard/Clo$testBetweenRaysAligned$462392.applyFrame`
+— a *test* file, not the file that was annotated. The root cause was not the
+annotation but the enum: inlining a 264-bytecode accessor body makes call sites
+bigger, not smaller. After change 3 the same fifteen annotations build clean.
+
+#### The three original items, adjudicated
+
+**(a) Six-mask branchless `ntz` — superseded, do not do it.** `java.lang.Long
+.numberOfTrailingZeros` is one token, is a `TZCNT` intrinsic rather than six masks,
+is pure in Flix, and is the same call the original makes. The estimated −19.8% was
+in the right direction and for the right reason; the proposed patch was simply the
+wrong way to get it.
+
+**(b) `@Inline` on short leaf defs — applied, and the caveat was real.** The
+estimate of 1.35-1.4x was in the right range for the annotation sweep considered
+alone. The caveat about the 64 KB limit is the one piece of advice in this section
+that cost an afternoon exactly as predicted, and the missing half of it is that the
+limit is reached because the *inlined body* is large — so shrink the data
+representation first and the annotation becomes safe.
+
+**(c) Pack `Move` into a single `Int64` — applied, and the fidelity warning was
+the right warning.** `score` is kept in the **low 32 bits** so that `Bits.toInt`
+recovers the identical signed value `Move.lessThan` compared before, with no
+assumption about the score's range. That is what makes the ordering — and hence the
+Huffman symbol written to the stream — provably unchanged. It was gated on
+`difftest`, never on perft, exactly as this section said it must be, and it passed
+on the first attempt.
+
+#### What is still open
+
+- **Game decode, 1.02-1.11x.** `GameEncoder.san` runs once per decoded ply and is
+  the largest remaining thing on that path. Decode allocation is 2.3-3.1x.
+- **Both clock directions, 1.15-1.35x — and the measurement is not trustworthy.**
+  At 36-183 ns/op a fixed per-invocation cost is a meaningful share of the ratio.
+  Three rounds have now said this and none has fixed it. Re-measure with `-bm ss`
+  or a 100x coarser workload *before* optimising further.
+- **`Move.mk` is ~960 bytecodes** and `@Inline` on it pushes its callers over the
+  JIT's budget. Deleting `MoveCtx` and threading its five members would shrink it.
 ---
 
 ## 6. Summary
@@ -1378,24 +1513,47 @@ command rather than by trusting the report that closed it:
 | **G3 board** | 11 new `@Export`s + a package-level drop-in `Board` | `sbt difftest/test`, `sbt scalaApiDropin/compile` | `game decode board (13 fields) 6108 / 6108`; **0 / 6108 when one accessor is deliberately mis-wired** (§5.2) |
 | **G4 benchmarks** | `benchmarks/` now `dependsOn(root, scalaApi)` | `sbt 'benchmarks/Jmh/run … org.lichess.compression.benchmark.*'` | game and clock tables reproduce within a few percent; cold start 109.4 / 67.3 ms (§5.7) |
 
-What replaces them is a measurement rather than an unknown, and it is not
-flattering: **the port is about 5× slower than the original on the game codec and
-allocates 10-90× more, for byte-identical output.** The end-to-end perft sweep
-agrees independently of JMH: 494 s against 161 s for the same 4.1 billion nodes.
-That is a cost with nothing bought on the correctness side; what it buys is the
-absence of shared mutable state and a compiler that enforces it. §5.8 lists three
-optimisations that were measured and deliberately not applied.
+What replaced them was a measurement rather than an unknown, and it was not
+flattering: the port as first written was about 5× slower than the original on the
+game codec and allocated 10-90× more, for byte-identical output (§5.7).
+
+**§5.8 is the optimisation campaign that followed, and it changed that answer
+without changing a single emitted byte.** Where it stands now:
+
+- **Game encode is faster than the Scala original** on all three length bands —
+  0.82× / 0.84× / 0.88× of its time — and allocates **less** than it does,
+  0.34-0.47×.
+- **The end-to-end perft sweep is 2.03× faster**: 79 s against 160.5 s for the same
+  4 135 458 706 nodes and the same move-order-sensitive checksum.
+- **Game decode and both clock directions are still slower**: 1.02-1.11× on decode,
+  1.15-1.35× on the clock. Allocation outside game encode is still 1.28-3.33×.
+- Cold start went 172.3 ms → 76.2 ms against Scala's unchanged ~69 ms.
+
+So the honest summary is that **nine of the twelve throughput rows are still on the
+slow side of parity, and three — all of them game encode — have crossed it** — an
+implementation that was uniformly 3-5× behind is now ahead on one direction of one
+codec and on move generation, and within a few percent to a third on the rest.
+"Five times faster than it was" and "faster than Scala" are different claims, and
+only the first holds everywhere. What the port buys remains the same: no shared mutable
+state, and a compiler that enforces it.
 
 **Three numbers in this document did not reproduce and are flagged in place rather
 than quietly kept.** §5.5's profiling percentages (0.7% / 0.8% / 6.1%, 52%, 14%)
-and §5.8's −19.8% and 1.35-1.4× come from a pass whose harness was never committed,
-and no command in this repository produces them; the *mechanisms* they attribute to
-were re-verified against the Flix standard-library source, only the percentages
-were not. §5.5's `SetupPlacementBench` A/B reproduced its conclusion but not its
-number — "~162 ms" became ~97 and ~101 ms on two re-runs. And an earlier revision
-of §5.5 claimed the sweep was "8m39s against 5m10s", which is simply wrong for the
-Scala side; §4.3's 494 s / 161 s replace it. Being able to say which claims failed
-to reproduce is the point of the round that produced this revision.
+come from a pass whose harness was never committed, and no command in this
+repository produces them; the *mechanisms* they attribute to were re-verified
+against the Flix standard-library source, only the percentages were not. §5.5's
+`SetupPlacementBench` A/B reproduced its conclusion but not its number — "~162 ms"
+became ~97 and ~101 ms on two re-runs. And an earlier revision of §5.5 claimed the
+sweep was "8m39s against 5m10s", which is simply wrong for the Scala side.
+
+§5.8's two old estimates — −19.8% for a hand-written `ntz` and 1.35-1.4× for the
+`@Inline` sweep — have now been **adjudicated by measurement rather than merely
+flagged**: the first was superseded (the JVM intrinsic is callable directly and is
+better than the proposed patch), the second was applied and its stated hazard fired
+exactly as written. §4.3's 494 s / 161 s have likewise been superseded by 79 s /
+160.5 s from the same committed script. Being able to say which claims failed to
+reproduce, and then closing them out, is the point of the rounds that produced this
+revision.
 
 The gaps that remain are smaller and named where they belong: the perft corpus
 records depth-4 expectations and says nothing deeper (§4.6); `Bitboard.squareSet`

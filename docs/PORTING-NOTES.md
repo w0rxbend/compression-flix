@@ -166,9 +166,13 @@ mod Buf {
   including the whole builder — must live in that struct's own module, which then
   exports accessor functions. `src/BitOps.flix` is laid out this way
   (`mod BitWriter` owns `struct BitWriter` and every `w->` in the program).
-- This constraint is another reason to prefer a single-case `enum` for read-only
+- This constraint used to be a reason to prefer a single-case `enum` for read-only
   data: enum cases are `pub` and can be destructured anywhere, so the type does
-  not drag its whole API into one module.
+  not drag its whole API into one module. **On a hot path that trade is wrong** —
+  a single-case enum destructure materialises *every* field on every read, so a
+  wide one costs an order of magnitude more than a struct field load. See
+  "A single-case `enum` destructure materialises every field" below. Keep the enum
+  for cold, narrow data; use a struct for anything wide or hot.
 - Fields are immutable unless declared `mut`.
 - Mutation of an `Array[a, r]` or a `mut` field carries the region effect `\ r`.
 - Reading a non-`mut` field is **pure**, even though the struct is region-allocated.
@@ -218,9 +222,34 @@ So: `Vector` is not slower than `Array`, and **Flix records are ~3x slower than
 structs/enums for field access** — do not use a record as a hot-path table
 container, however much nicer the named fields read.
 
+The table above measures a *one-field* container, where enum and struct tie. They
+do **not** tie once the container is wide: see "A single-case `enum` destructure
+materialises every field" below, which is why `Tables` in this port is a struct.
+
 A `struct` always needs a region type parameter (doc.flix.dev: "Every struct must
-have a region type parameter and it must be the last in the type parameter list"),
-so a table that needs no region at all must be a single-case `enum`, not a struct.
+have a region type parameter and it must be the last in the type parameter list").
+That does **not** force a region-free table to be an enum, and an earlier revision
+of this note was wrong to say it did. Build the struct in a local region and cast
+the result to `Static`:
+
+```flix
+pub struct Tables[r: Region] { attacks: Vector[Int64], /* ... */ }
+mod Tables {
+    pub def mk(): Tables[Static] = region rc {        // still pure!
+        let attacks = Array.repeat(rc, 88772, 0i64);
+        fill(attacks);
+        let t = new Tables @ rc { attacks = Array.toVector(attacks) };
+        unchecked_cast(t as Tables[Static])
+    }
+}
+```
+
+Reading a non-`mut` field is pure, so `mk()` and every accessor keep the exact
+signatures the enum version had — no `\ IO`, no region parameter, no effect leaking
+into callers. The cast exposes nothing, because the struct has no `mut` field and
+never escapes as a mutable thing, and a Flix region frees nothing — a region handle
+is an ordinary GC-rooted object, so the value stays valid after `rc` goes out of
+scope. `src/Bitboard.flix` is built exactly this way.
 
 ### Modules cannot be reopened
 `mod Square { ... }` may appear **once in the whole program**. A second block, in
@@ -802,20 +831,226 @@ the result before reading the second clock.
 
 Every one of those is a **compiler** diagnostic — the `--Xbenchmark-*` family
 benchmarks the *compiler*, not your program. There is no `-O`, no inliner
-threshold and no way to disable the `Thunk$`/`Suspension$` trampoline. Every
-tuning lever is source-level: `@Inline` on small leaf functions, avoiding the slow
-standard-library primitives (below), and changing data representation.
+threshold and no way to disable the `Thunk$`/`Suspension$` trampoline.
+
+**Every tuning lever is source-level**, and the next section is the list of them.
+That is not as limiting as it sounds: applying them to this port turned a codec
+that was 5x slower than its Scala original into one that is faster.
+
+## Making Flix fast — mechanisms verified in bytecode
+
+Everything in this part was established by compiling a probe and reading `javap`
+output, and every claim was then applied to this port and measured with JMH. The
+campaign it comes from took the game codec from **5.1-5.4x slower than the Scala
+original to 0.82-0.88x on encode** and the depth-4 perft sweep from 494 s to 79 s
+against Scala's 160.5 s, without changing an emitted byte. See `REWRITE.md` §5.8.
+
+Read this before optimising anything. Four of the six items below are invisible in
+the source and none of them is in the language documentation.
+
+### `java.lang` statics on the boxed primitives are PURE — this is the escape hatch
+
+A method on `java.lang.{Boolean, Byte, Character, Double, Float, Integer, Long,
+Number, Short}` can be called from a pure `def`: no `unsafe` block, no `IO` effect,
+no signature change. The compiler enforces this rather than merely permitting it —
+wrapping such a call in `unsafe IO` is a **compile error**:
+
+```
+-- Redundancy Error [E7623] --
+>> Redundant unsafe block, the expression is pure.
+   pub def ntzUnsafe(x: Int64): Int32 = unsafe IO { Long.numberOfTrailingZeros(x) }
+Explanation: The block unsafely removes the 'IO' effect, but the body expression is pure.
+```
+
+That matters because **Flix's own numeric standard library is often much slower
+than the `java.lang` method of the same name**, and swapping in the Java one costs
+nothing structurally. Verified by disassembling both forms of the same def:
+
+```flix
+pub def ntz(x: Int64): Int32 = Long.numberOfTrailingZeros(x)   // java.lang
+pub def ntzStd(x: Int64): Int32 = Int64.numberOfTrailingZeros(x)  // Flix stdlib
+```
+
+```
+ntz     ->  lload_0
+            invokestatic java/lang/Long.numberOfTrailingZeros:(J)I   <- the intrinsic
+
+ntzStd  ->  new           Int64/Def$numberOfTrailingZeros           <- a heap continuation
+            dup; invokespecial <init>; putfield arg0; areturn        <- handed to the trampoline
+```
+
+`Int64.numberOfTrailingZeros` delegates to `lowestOneBitPosition` and then to
+`oneBitPositionHelper`, which is a **recursive scan testing one bit at a time**,
+each step a shift plus a `remainder`, through `Int64.getBit` — whose `pos` argument
+is a named record, so each iteration also allocates. Java's is one `TZCNT`. In a
+bitboard port `lsb` runs once per set bit of every bitboard iterated in move
+generation, so this one substitution was the single largest win in this repository.
+
+The replacements this port uses, all verified equivalent by exhaustive or
+multi-million-input probes before being applied:
+
+| Flix standard library | what it actually compiles to | pure `java.lang` replacement |
+|---|---|---|
+| `Int64.numberOfTrailingZeros` | recursive per-bit scan | `Long.numberOfTrailingZeros` (TZCNT) |
+| `Int64.numberOfLeadingZeros` | recursive per-bit scan | `Long.numberOfLeadingZeros` (LZCNT) |
+| `Int64.truncateToInt32(x)` | `Long.valueOf(x).intValue()` — allocates | `Long.hashCode(x & 0xffffffffL)` |
+| `Int8.toInt32(b)` | `Byte.valueOf(b).intValue()` | `Byte.toUnsignedInt(b)` |
+| `Int32.toInt64(x)` | `Integer.valueOf(x).longValue()` | `Integer.toUnsignedLong(x)` (zero-extending) |
+| `Char.toBmpCodePoint(c)` | `Short.valueOf(..).intValue()`, masked | `Character.hashCode(c)`, i.e. `(int) c` |
+| `Int32.truncateToInt8(x)` | `Integer.valueOf(x).byteValue()` | none exists — see below |
+
+**Flix has no primitive narrowing or widening operation at all**; every numeric
+conversion in its standard library round-trips through a `java.lang` box. Outside
+the small-integer caches that is a real allocation per conversion.
+
+`Int32.truncateToInt8` is the one with no pure Java static. It can still be made
+free rather than removed, by forcing the argument into `Integer`'s cache — the
+sign-extend identity `((x & 0xff) ^ 0x80) - 0x80` equals `(byte) x` widened back
+for every `int` and always lands in `-128..127`:
+
+```flix
+pub def toByte(x: Int32): Int8 =
+    Integer.valueOf(Bits.bxor(Bits.band(x, 0xff), 0x80) - 0x80).byteValue()
+```
+
+### A call to a *different* def in tail position becomes a heap allocation
+
+This is the least obvious item here and it was worth **2.1x on one of this port's
+two codecs** when it was accidentally reintroduced.
+
+Flix compiles a call to another def in tail position into a heap continuation which
+the caller's trampoline then dispatches through `invokeinterface Thunk$.invoke()` —
+megamorphic, because thousands of classes in a jar implement `Thunk$`. Moving the
+same call out of tail position compiles it to a plain `invokestatic`. Verified on
+two defs whose bodies are otherwise identical:
+
+```flix
+pub def tailCall(x: Int32, a: Array[Int32, r]): Unit \ r = sink(x, a)
+pub def notTailCall(x: Int32, a: Array[Int32, r]): Unit \ r = { sink(x, a); () }
+```
+
+```
+tailCall     ->  new Tail/Def$sink; dup; invokespecial <init>
+                 putfield arg0; putfield arg1; areturn      <- allocates, returns a thunk
+
+notTailCall  ->  iload_0; aload_1; checkcast [I
+                 invokestatic Tail/Def$sink.staticApply     <- direct call, no allocation
+```
+
+Two ways to take a call out of tail position:
+
+* a trailing `; ()` on a `Unit`-returning def — the identity on a `Unit` expression;
+* `@Inline` on a def whose body is a single delegation, so the *caller* issues the
+  `invokestatic` and the thunk never exists.
+
+`let r = f(x); r` does **not** work — a `let` of a tail call is still a tail call.
+
+**Do this only to bounded delegations** (a wrapper calling a loop, one extra JVM
+frame). Never to a self- or mutually recursive loop: the thunk is what makes those
+stack-safe. Self-recursive tail calls are unaffected anyway — Flix compiles those
+to `goto`.
+
+A trailing `()` looks exactly like dead code and an eager cleanup will delete it.
+Comment every site. This port documents the rule once, above `Board.put`, and
+points at it from the other five files.
+
+### A single-case `enum` destructure materialises every field
+
+`let Wide.Wide(_, _, c, _, _) = w` does **not** load only `c`. Verified on a
+five-field single-case enum against a five-field struct, both reading one field,
+both `@DontInline` to force the worst case:
+
+| | bytecode |
+|---|---|
+| 5-field single-case **enum**, four fields wildcarded | 76 lines: an ordinal check, **all five** `checkcast`+`getfield` pairs, and a provably dead `new MatchError$` / `new ReifiedSourceLocation$` / `athrow` block |
+| the same five fields as a **struct** | one `getfield`, one `checkcast` |
+
+In this port that was the difference between a 264-bytecode table read and a
+12-bytecode one, on a function called several times per generated move. It also
+compounds: an accessor whose *inlined body* is 264 bytecodes makes every call site
+bigger, so `@Inline` on it is a pessimisation and can blow the JVM's 64 KB method
+limit — which is exactly what happened here, and why the "shrink the representation
+first" order matters.
+
+So: for read-only data that is wide or hot, use a `struct` (built in a local region
+and cast to `Static`, as shown earlier) or a `type alias` over the underlying
+representation. Keep single-case enums for cold or narrow data.
+
+The same reasoning killed two more shapes in this port: a seven-field `Move` enum
+became `type alias Move = Int64` with the fields packed into one word, and a
+one-field `Psqt` enum became `type alias Psqt = Vector[Int32]`.
+
+### `@Inline` is unconditional, and only `flix build-jar` can gate it
+
+* `@Inline` has **no size budget**. Flix inlines what you annotate, however large.
+* It is silently ignored on self-recursive defs.
+* `@Inline` and `@DontInline` are the only annotations that reach code generation;
+  `@TailRecursive`, `@Terminates`, `@Parallel`, `@Lazy` do not affect the emitted
+  bytecode in 0.75.1.
+* **Gate every `@Inline` batch on `flix build-jar`, never on `flix check`.** `check`
+  does no code generation, so it cannot see `MethodTooLargeException` — and when
+  that fires it names a *test* file's continuation frame rather than the file you
+  annotated. See "`flix check` does not catch the JVM 64 KB method limit".
+* Flix's **automatic** inliner is site-dependent in a way worth knowing: in this
+  port `Bitboard.ranks` was compiled as a real call while the structurally identical
+  `Bitboard.files` was inlined. If you want a family inlined, annotate the whole
+  family rather than the members that happen to need it.
+
+One JIT-level consequence, because Flix's inliner feeds HotSpot's: a def that lands
+just under HotSpot's `FreqInlineSize` (325 bytecodes) gets inlined *and* has its
+`Value$` box scalarised away; one just over it gets neither. Several changes in this
+port paid entirely because they pushed a hot def across that line. Measure — a
+change that looks obviously right from bytecode size alone can still lose (splitting
+`readBits`/`writeBits` here was a 10% regression).
+
+### Named-argument standard-library functions allocate a record per call
+
+`Int32.logicalRightShift(dist: {dist = Int32}, x: Int32)` takes its shift distance
+as a **record**, and `String.startsWith(prefix: {prefix = String}, s: String)` takes
+its prefix the same way. Each call allocates a `RecordExtend`, then resolves the
+field by **string comparison** at run time, once per mention of `dist#dist` in the
+body. One `>>>` through the standard library cost about five heap allocations.
+
+Write the body out instead. `x >>> n` is `(x >> n) & ~((-1 << (31 - n)) << 1)` for
+`Int32` (63 for `Int64`), which is also **branchless** where the standard library's
+own formula branches on the sign of `x` — the JVM has no `>>>` for a conditionally
+signed value, so that branch survives into machine code. Inside a magic-bitboard
+lookup the operand is a hash, so it mispredicts about half the time.
+
+Audit for other named-argument stdlib calls on hot paths while you are there.
+
+### String interpolation is a chain of `String.concat`
+
+`"${a}${b}${c}"` compiles to successive `java.lang.String.concat` calls, and a
+`Char` inside an interpolation goes through `Character.toString`, allocating a
+one-character `String`. For anything per-iteration, build with `StringBuilder` and
+use `appendCodePoint` for characters — `append` would route through `ToString` and
+allocate the very `String` you are trying to avoid.
+
+### Reading bytecode: clean the build directory first
+
+`flix/build/` is never pruned and Flix names generated closure classes with a fresh
+counter on every compilation, so an incremental build leaves several generations of
+`Def$foo$NNNNNN.class` side by side. `javap` one of the stale ones and you will draw
+a confident, wrong conclusion. Always `rm -rf flix/build flix/artifact` before
+measuring bytecode sizes. (See "`flix/build/` accumulates stale classes".)
+
+Note also that `unzip -l jar | tail -1` reports the **uncompressed** total, not the
+file size — 3.3 MB uncompressed for this port's 1.87 MB jar. Do not read a jar-size
+regression into it.
 
 ### Standard-library primitives that are much slower than their Java namesakes
 
-Read the source before assuming a stdlib function maps to a JVM intrinsic.
+Summarised here because it is the trap most likely to be hit by someone who has not
+read the rest of this section. **Read the standard-library source before assuming a
+Flix function maps to a JVM intrinsic.**
 
-- `Int64.numberOfTrailingZeros` → `lowestOneBitPosition` → `oneBitPositionHelper`,
-  which is a **linear scan testing one bit at a time**, each step a shift plus a
-  `remainder`. Java's is one `TZCNT`. In a bitboard port this is the hottest
+- `Int64.numberOfTrailingZeros` / `numberOfLeadingZeros` → a recursive per-bit scan.
+  Java's are single-instruction intrinsics. In a bitboard port this is the hottest
   function you have.
-- `Int64.logicalRightShift(dist: {dist = Int32}, x: Int64)` takes its shift
-  distance as a **record**.
+- `Int64.logicalRightShift(dist: {dist = Int32}, x: Int64)` — the shift distance is
+  a record, on a function called once per ray step.
+- Every numeric conversion (`truncateTo*`, `to*`) boxes through `java.lang`.
 
 ## Validation protocol for parallel work
 

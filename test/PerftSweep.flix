@@ -151,7 +151,7 @@ mod PerftSweep {
         rowLoop(tables, psqt, zob, rows, depth, checkExpected, progress, 0, 0i64, 0i64, 0)
     }
 
-    def rowLoop(tables: Tables, psqt: Psqt, zob: Vector[Int32], rows: List[Row], depth: Int32,
+    def rowLoop(tables: Tables[Static], psqt: Psqt, zob: Vector[Int32], rows: List[Row], depth: Int32,
             checkExpected: Bool, progress: Bool, count: Int32, nodes: Int64, h: Int64,
             mismatches: Int32): (Int32, Int64, Int64, Int32) \ IO =
         match rows {

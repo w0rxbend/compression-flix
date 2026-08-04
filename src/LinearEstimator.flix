@@ -29,14 +29,17 @@ mod LinearEstimator {
     ///
     pub def encode(dest: Array[Int32, r], startTime: Int32): Unit \ r =
         let maxIdx = Array.length(dest) - 1;
-        encodeRange(dest, -1, startTime, maxIdx, Array.get(maxIdx, dest))
+        // Trailing `()`: see the note in `mod Board`.
+        encodeRange(dest, -1, startTime, maxIdx, Array.get(maxIdx, dest));
+        ()
 
     ///
     /// Inverse of `encode`: turns residuals back into absolute values, in place.
     ///
     pub def decode(dest: Array[Int32, r], startTime: Int32): Unit \ r =
         let maxIdx = Array.length(dest) - 1;
-        decodeRange(dest, -1, startTime, maxIdx, Array.get(maxIdx, dest))
+        decodeRange(dest, -1, startTime, maxIdx, Array.get(maxIdx, dest));
+        ()
 
     ///
     /// `midIdx == startIdx` is the recursion's base case: it means the range has no

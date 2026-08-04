@@ -1045,7 +1045,7 @@ mod TestBitboard {
         Assert.assertEq(expected = 0, pairLoop(t, 0, 0, 0))
     }
 
-    def pairLoop(t: Tables, a: Int32, b: Int32, bad: Int32): Int32 =
+    def pairLoop(t: Tables[Static], a: Int32, b: Int32, bad: Int32): Int32 =
         if (a >= 64) bad
         else if (b >= 64) pairLoop(t, a + 1, 0, bad)
         else {

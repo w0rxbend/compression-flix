@@ -41,6 +41,7 @@ mod Role {
     /// Used as a table index (`Move.PSQT(role.index)`, `ZobristHash.hashPiece`)
     /// and inside `Move.score`, so the exact values matter.
     ///
+    @Inline
     pub def index(r: Role): Int32 = match r {
         case Role.Pawn   => 0
         case Role.Knight => 1
@@ -76,6 +77,24 @@ mod Role {
         case 4 => Some(Role.Queen)
         case 5 => Some(Role.King)
         case _ => None
+    }
+
+    ///
+    /// The inverse of `index` on `0..5`, total where `fromIndex` is partial.
+    ///
+    /// Used where the index was written by this library and so cannot be out of
+    /// range — the packed `Move` and the piece tables — and where allocating the
+    /// `Some` that `fromIndex` returns would be a per-move cost.
+    ///
+    @Inline
+    pub def ofIndex(i: Int32): Role = match i {
+        case 0 => Role.Pawn
+        case 1 => Role.Knight
+        case 2 => Role.Bishop
+        case 3 => Role.Rook
+        case 4 => Role.Queen
+        case 5 => Role.King
+        case _ => bug!("Role.ofIndex: index out of range")
     }
 
     ///

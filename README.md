@@ -107,22 +107,36 @@ jar.**
 
 ## How it performs
 
-Byte-identical output is not free. Measured on one machine, both implementations
-in the same JVM:
+The port started at a uniform ~5x slower than the original. After an optimisation
+campaign gated on byte-identical output, it is **ahead on game encode and on move
+generation, and still behind on everything else**:
 
-| | Flix / Scala |
-|---|---|
-| Game codec throughput | **~5x slower** |
-| Clock codec throughput | **~3-4x slower** |
-| Game decode allocation | **79-95x more** |
-| Cold start | 172 ms vs 69 ms |
+| | before | after |
+|---|---|---|
+| game encode | 5.08-5.30x slower | **0.818-0.877x — faster** |
+| game encode allocation | 24.6-26.9x more | **0.336-0.468x — less** |
+| perft depth-4, 4.1e9 nodes | 494 s vs 161 s | **79 s vs 160.5 s — 2.03x faster** |
+| game decode | 4.72-5.38x slower | 1.017-1.109x slower |
+| clock encode | 4.24-4.43x slower | 1.266-1.349x slower |
+| clock decode | 2.75-3.98x slower | 1.149-1.307x slower |
+| cold start | 172 ms vs 69 ms | 76.2 ms vs 68.6 ms |
 
-Full tables, methodology, hardware and caveats: [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
-The short version of *why* is that Flix has no global mutable state, so the
-88,772-entry magic attack table is threaded through every call instead of living
-in a static field, and `Board.copy` allocates a struct per search node. This is
-a first port with no optimisation pass; `docs/REWRITE.md` §5.8 lists three
-optimisations that were measured and deliberately not applied.
+It does **not** beat the original outright. The Scala side was never given an
+equivalent optimisation pass, so the defensible claim is "faster than the
+reference implementation it copies, on some paths" — not that Flix is faster
+than Scala.
+
+Most of the gain was not algorithmic. Flix's `Int64.numberOfTrailingZeros` is a
+recursive per-bit scan that compiles to a heap continuation, where
+`java.lang.Long`'s is a pure call and a JIT intrinsic. Beyond that it was the
+calling convention rather than the data structures: a body in tail position
+allocates a continuation object, a single-case enum destructure emits every field
+plus a dead `MatchError` block, and named-argument stdlib functions allocate a
+record. [docs/PORTING-NOTES.md](docs/PORTING-NOTES.md) records each mechanism with
+the bytecode that demonstrates it — useful to anyone writing a Flix hot loop.
+
+Full tables, methodology, hardware and per-row caveats:
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ## How it is verified
 

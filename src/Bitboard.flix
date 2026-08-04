@@ -20,7 +20,7 @@
 /// Bitboard.rookAttacks(t, square, occupied)    // lookups take `t` first
 /// ```
 ///
-/// # `Tables` is immutable, region-free and pure
+/// # `Tables` is immutable and pure
 ///
 /// The Scala tables are `val` arrays written once by the static initializer and
 /// only ever read afterwards. So `Tables` holds `Vector`s, not region-allocated
@@ -30,15 +30,17 @@
 ///
 /// Concretely that means:
 ///
-///   * `Tables.mk(): Tables` is pure — no region argument, no `\ IO`, no `Static`.
+///   * `Tables.mk(): Tables[Static]` is pure — no region argument, no `\ IO`.
+///     (`Tables` is a `struct`, so it must name a region; it is built in a local
+///     region and handed out as `Static`. Reading a non-`mut` struct field is
+///     pure, so no effect leaks. See the note on the declaration below.)
 ///   * `Bitboard.rookAttacks`, `between`, `rays`, `aligned` and the rest are pure,
-///     so no region effect leaks into `Board`, `MoveList` or the game encoder, and
-///     the `@Export` layer needs no `Tables[Static]` handle.
-///   * `Tables` carries no region type parameter, so it does not have to unify with
-///     (or be threaded alongside) the region of a `Board`.
+///     so no region effect leaks into `Board`, `MoveList` or the game encoder.
+///   * `Tables[Static]` does not have to unify with the region of a `Board`:
+///     `Board[r]` holds a `Tables[Static]` and the two regions are independent.
 ///
-/// This mirrors `Huffman.HuffmanTable`, which is also pure region-free data; the
-/// two can be bundled into one "static tables" value at integration time.
+/// This mirrors `Huffman.HuffmanTable`, which is also pure static data; the two
+/// can be bundled into one "static tables" value at integration time.
 ///
 /// `Vector.get` is not slower than `Array.get` here — measured at 428 ms vs 460 ms
 /// for 10^8 dependent lookups into an 88772-entry table on this machine — and it
@@ -102,48 +104,52 @@
 ///
 
 ///
-/// The precomputed bitboard tables: immutable, region-free, built once by
-/// `Tables.mk()`.
+/// The precomputed bitboard tables: immutable, built once by `Tables.mk()`.
 ///
-/// The fields are positional and in this order; sizes mirror the Scala arrays.
-/// Nothing outside `mod Tables` should destructure this — use the accessors.
+/// # Why a `struct` and not an `enum`
 ///
-/// ```
-///   0  ranks             8      Scala `RANKS`
-///   1  files             8      Scala `FILES`
-///   2  knightAttacks     64     Scala `KNIGHT_ATTACKS`
-///   3  kingAttacks       64     Scala `KING_ATTACKS`
-///   4  whitePawnAttacks  64     Scala `WHITE_PAWN_ATTACKS`
-///   5  blackPawnAttacks  64     Scala `BLACK_PAWN_ATTACKS`
-///   6  between           4096   Scala `BETWEEN`,  flattened `a * 64 + b`
-///   7  rays              4096   Scala `RAYS`,     flattened `a * 64 + b`
-///   8  attacks           88772  Scala `ATTACKS`
-///   9  rookMask          64     Scala `Magic.ROOK(i).mask`
-///   10 rookFactor        64     Scala `Magic.ROOK(i).factor`
-///   11 rookOffset        64     Scala `Magic.ROOK(i).offset`
-///   12 bishopMask        64     Scala `Magic.BISHOP(i).mask`
-///   13 bishopFactor      64     Scala `Magic.BISHOP(i).factor`
-///   14 bishopOffset      64     Scala `Magic.BISHOP(i).offset`
-/// ```
+/// This was a 15-field single-case `enum` until it was measured. Flix compiles
+/// `let Tables.Tables(_, .., v, ..) = t` into fifteen `checkcast`+`getfield`+
+/// `astore` triples **regardless of the wildcards**, followed by a provably dead
+/// `new MatchError$ / new ReifiedSourceLocation$ / athrow` block. One table read
+/// cost 264 bytecodes that way. A `struct` field read is a single `getfield`, and
+/// the same accessor measures 22 bytecodes — and 12 once `@Inline`d, which is the
+/// same `getfield; checkcast [J; laload` shape as the Scala original's
+/// `KNIGHT_ATTACKS(sq)`.
 ///
-pub enum Tables {
-    case Tables(
-        Vector[Int64],  // 0  ranks
-        Vector[Int64],  // 1  files
-        Vector[Int64],  // 2  knightAttacks
-        Vector[Int64],  // 3  kingAttacks
-        Vector[Int64],  // 4  whitePawnAttacks
-        Vector[Int64],  // 5  blackPawnAttacks
-        Vector[Int64],  // 6  between
-        Vector[Int64],  // 7  rays
-        Vector[Int64],  // 8  attacks
-        Vector[Int64],  // 9  rookMask
-        Vector[Int64],  // 10 rookFactor
-        Vector[Int32],  // 11 rookOffset
-        Vector[Int64],  // 12 bishopMask
-        Vector[Int64],  // 13 bishopFactor
-        Vector[Int32]   // 14 bishopOffset
-    )
+/// That is also what unblocks `@Inline` on the accessors. Annotating the *enum*
+/// accessors made every call site 3.3x **bigger** and blew the JVM's 64 KB method
+/// limit inside `test/TestBitboard.flix`; annotating the struct accessors makes
+/// each call site 5.4x smaller. See the note above the accessors.
+///
+/// # Why `Tables[Static]` and not `Tables[r]`
+///
+/// A Flix `struct` must carry a region. These tables are process-wide immutable
+/// data with no `mut` field, so they live in `Static` and every consumer names
+/// them `Tables[Static]`. In particular `Board[r]` holds a `Tables[Static]`: the
+/// two regions do not have to agree, and a `Board` in a short-lived region can
+/// still read tables that outlive it.
+///
+/// Reading a non-`mut` struct field is **pure**, so `Tables.mk()` and every
+/// accessor keep the signatures they had as an enum — no `\ IO`, no region
+/// argument, no effect leaking into `Board`, `MoveList` or the encoder.
+///
+pub struct Tables[r: Region] {
+    ranks:            Vector[Int64],   // Scala `RANKS`,              8
+    files:            Vector[Int64],   // Scala `FILES`,              8
+    knightAttacks:    Vector[Int64],   // Scala `KNIGHT_ATTACKS`,     64
+    kingAttacks:      Vector[Int64],   // Scala `KING_ATTACKS`,       64
+    whitePawnAttacks: Vector[Int64],   // Scala `WHITE_PAWN_ATTACKS`, 64
+    blackPawnAttacks: Vector[Int64],   // Scala `BLACK_PAWN_ATTACKS`, 64
+    between:          Vector[Int64],   // Scala `BETWEEN`,            4096, flattened `a * 64 + b`
+    rays:             Vector[Int64],   // Scala `RAYS`,               4096, flattened `a * 64 + b`
+    attacks:          Vector[Int64],   // Scala `ATTACKS`,            88772
+    rookMask:         Vector[Int64],   // Scala `Magic.ROOK(i).mask`,     64
+    rookFactor:       Vector[Int64],   // Scala `Magic.ROOK(i).factor`,   64
+    rookOffset:       Vector[Int32],   // Scala `Magic.ROOK(i).offset`,   64
+    bishopMask:       Vector[Int64],   // Scala `Magic.BISHOP(i).mask`,   64
+    bishopFactor:     Vector[Int64],   // Scala `Magic.BISHOP(i).factor`, 64
+    bishopOffset:     Vector[Int32]    // Scala `Magic.BISHOP(i).offset`, 64
 }
 
 mod Tables {
@@ -161,7 +167,7 @@ mod Tables {
     /// memoized, so calling it per move would be a catastrophic performance bug.
     /// Purity means the compiler will not warn you about that — hold the value.
     ///
-    pub def mk(): Tables = region rc {
+    pub def mk(): Tables[Static] = region rc {
         let ranks            = Array.repeat(rc, 8, 0i64);
         let files            = Array.repeat(rc, 8, 0i64);
         let knightAttacks    = Array.repeat(rc, 64, 0i64);
@@ -186,18 +192,29 @@ mod Tables {
                              rookMask, rookFactor, rookOffset, bishopMask, bishopFactor, bishopOffset, 0);
         initBetweenRays(between, rays, 0, 0);
 
-        Tables.Tables(
-            Array.toVector(ranks),
-            Array.toVector(files),
-            Array.toVector(knightAttacks),
-            Array.toVector(kingAttacks),
-            Array.toVector(whitePawnAttacks),
-            Array.toVector(blackPawnAttacks),
-            Array.toVector(between),
-            Array.toVector(rays),
-            Array.toVector(attacks),
-            rookMask, rookFactor, rookOffset,
-            bishopMask, bishopFactor, bishopOffset)
+        // Built in the local region and handed out as `Static`. The struct has no
+        // `mut` field and never escapes as a mutable thing, so the cast exposes
+        // nothing: it is the same immutable snapshot the enum version returned.
+        // (Flix regions free nothing; a region handle is an ordinary GC-rooted
+        // object, so the value stays valid after `rc` goes out of scope.)
+        let t = new Tables @ rc {
+            ranks            = Array.toVector(ranks),
+            files            = Array.toVector(files),
+            knightAttacks    = Array.toVector(knightAttacks),
+            kingAttacks      = Array.toVector(kingAttacks),
+            whitePawnAttacks = Array.toVector(whitePawnAttacks),
+            blackPawnAttacks = Array.toVector(blackPawnAttacks),
+            between          = Array.toVector(between),
+            rays             = Array.toVector(rays),
+            attacks          = Array.toVector(attacks),
+            rookMask         = rookMask,
+            rookFactor       = rookFactor,
+            rookOffset       = rookOffset,
+            bishopMask       = bishopMask,
+            bishopFactor     = bishopFactor,
+            bishopOffset     = bishopOffset
+        };
+        unchecked_cast(t as Tables[Static])
     }
 
     /// `RANKS(i) = 0xffL << (i * 8)` and `FILES(i) = 0x0101010101010101L << i`.
@@ -312,83 +329,131 @@ mod Tables {
             initBetweenRays(between, rays, a, b + 1)
         }
 
+    // ------------------------------------------------------------- the accessors
+    //
+    // These are `@Inline`, and that is only safe because `Tables` is a `struct`.
+    //
+    // As a 15-field `enum` the same annotation was tried and reverted: Flix
+    // materialises every field of a single-case enum on every destructure, plus a
+    // dead `MatchError$`/`ReifiedSourceLocation$` branch, so an *inlined* accessor
+    // body was 264 bytecodes and three of them in one caller came to 819 — against
+    // 248 for the same caller with no inlining at all. That is what breached the
+    // JVM's 64 KB method limit inside `test/TestBitboard.flix`, which asserts one
+    // table entry per statement over 4096 pairs. `flix check` does no codegen and
+    // cannot see it; only `flix build-jar` can.
+    //
+    // A struct field read is one `getfield`. Inlined, each accessor is ~12
+    // bytecodes (`getfield; checkcast [J; iload; laload`), the same shape as the
+    // Scala original's `KNIGHT_ATTACKS(sq)`, so the same three-read caller is 46
+    // bytecodes — 5.4x *smaller* than not inlining. Measured, not guessed.
+    //
+    // The second-order effect is the one that matters more: `Board.attacksToOcc`,
+    // `Board.isSafe`, `Move.mk` and the `gen*` family were all far over the JIT's
+    // ~300-bytecode inlining budget largely because of these destructures, so the
+    // JIT could not inline them and escape analysis never got to scalarise their
+    // boxed returns.
+
     /// `Bitboard.RANKS(i)`.
-    pub def ranks(t: Tables, i: Int32): Int64 =
-        let Tables.Tables(v, _, _, _, _, _, _, _, _, _, _, _, _, _, _) = t;
-        Vector.get(i, v)
+    @Inline
+    pub def ranks(t: Tables[Static], i: Int32): Int64 = Vector.get(i, t->ranks)
 
     /// `Bitboard.FILES(i)`.
-    pub def files(t: Tables, i: Int32): Int64 =
-        let Tables.Tables(_, v, _, _, _, _, _, _, _, _, _, _, _, _, _) = t;
-        Vector.get(i, v)
+    @Inline
+    pub def files(t: Tables[Static], i: Int32): Int64 = Vector.get(i, t->files)
 
     /// `Bitboard.KNIGHT_ATTACKS(square)`.
-    pub def knightAttacks(t: Tables, square: Int32): Int64 =
-        let Tables.Tables(_, _, v, _, _, _, _, _, _, _, _, _, _, _, _) = t;
-        Vector.get(square, v)
+    @Inline
+    pub def knightAttacks(t: Tables[Static], square: Int32): Int64 = Vector.get(square, t->knightAttacks)
 
     /// `Bitboard.KING_ATTACKS(square)`.
-    pub def kingAttacks(t: Tables, square: Int32): Int64 =
-        let Tables.Tables(_, _, _, v, _, _, _, _, _, _, _, _, _, _, _) = t;
-        Vector.get(square, v)
+    @Inline
+    pub def kingAttacks(t: Tables[Static], square: Int32): Int64 = Vector.get(square, t->kingAttacks)
 
     /// `Bitboard.WHITE_PAWN_ATTACKS(square)`.
-    pub def whitePawnAttacks(t: Tables, square: Int32): Int64 =
-        let Tables.Tables(_, _, _, _, v, _, _, _, _, _, _, _, _, _, _) = t;
-        Vector.get(square, v)
+    @Inline
+    pub def whitePawnAttacks(t: Tables[Static], square: Int32): Int64 = Vector.get(square, t->whitePawnAttacks)
 
     /// `Bitboard.BLACK_PAWN_ATTACKS(square)`.
-    pub def blackPawnAttacks(t: Tables, square: Int32): Int64 =
-        let Tables.Tables(_, _, _, _, _, v, _, _, _, _, _, _, _, _, _) = t;
-        Vector.get(square, v)
+    @Inline
+    pub def blackPawnAttacks(t: Tables[Static], square: Int32): Int64 = Vector.get(square, t->blackPawnAttacks)
 
     /// `Bitboard.BETWEEN(a)(b)`.
-    pub def between(t: Tables, a: Int32, b: Int32): Int64 =
-        let Tables.Tables(_, _, _, _, _, _, v, _, _, _, _, _, _, _, _) = t;
-        Vector.get(a * 64 + b, v)
+    @Inline
+    pub def between(t: Tables[Static], a: Int32, b: Int32): Int64 = Vector.get(a * 64 + b, t->between)
 
     /// `Bitboard.RAYS(a)(b)`.
-    pub def rays(t: Tables, a: Int32, b: Int32): Int64 =
-        let Tables.Tables(_, _, _, _, _, _, _, v, _, _, _, _, _, _, _) = t;
-        Vector.get(a * 64 + b, v)
+    @Inline
+    pub def rays(t: Tables[Static], a: Int32, b: Int32): Int64 = Vector.get(a * 64 + b, t->rays)
 
     /// `Bitboard.ATTACKS(idx)`, the raw magic-table read.
-    pub def attackAt(t: Tables, idx: Int32): Int64 =
-        let Tables.Tables(_, _, _, _, _, _, _, _, v, _, _, _, _, _, _) = t;
-        Vector.get(idx, v)
+    @Inline
+    pub def attackAt(t: Tables[Static], idx: Int32): Int64 = Vector.get(idx, t->attacks)
 
     /// `Magic.ROOK(square).mask`, from the snapshot held by the tables.
-    pub def rookMask(t: Tables, square: Int32): Int64 =
-        let Tables.Tables(_, _, _, _, _, _, _, _, _, v, _, _, _, _, _) = t;
-        Vector.get(square, v)
+    @Inline
+    pub def rookMask(t: Tables[Static], square: Int32): Int64 = Vector.get(square, t->rookMask)
 
     /// `Magic.ROOK(square).factor`.
-    pub def rookFactor(t: Tables, square: Int32): Int64 =
-        let Tables.Tables(_, _, _, _, _, _, _, _, _, _, v, _, _, _, _) = t;
-        Vector.get(square, v)
+    @Inline
+    pub def rookFactor(t: Tables[Static], square: Int32): Int64 = Vector.get(square, t->rookFactor)
 
     /// `Magic.ROOK(square).offset`.
-    pub def rookOffset(t: Tables, square: Int32): Int32 =
-        let Tables.Tables(_, _, _, _, _, _, _, _, _, _, _, v, _, _, _) = t;
-        Vector.get(square, v)
+    @Inline
+    pub def rookOffset(t: Tables[Static], square: Int32): Int32 = Vector.get(square, t->rookOffset)
 
     /// `Magic.BISHOP(square).mask`.
-    pub def bishopMask(t: Tables, square: Int32): Int64 =
-        let Tables.Tables(_, _, _, _, _, _, _, _, _, _, _, _, v, _, _) = t;
-        Vector.get(square, v)
+    @Inline
+    pub def bishopMask(t: Tables[Static], square: Int32): Int64 = Vector.get(square, t->bishopMask)
 
     /// `Magic.BISHOP(square).factor`.
-    pub def bishopFactor(t: Tables, square: Int32): Int64 =
-        let Tables.Tables(_, _, _, _, _, _, _, _, _, _, _, _, _, v, _) = t;
-        Vector.get(square, v)
+    @Inline
+    pub def bishopFactor(t: Tables[Static], square: Int32): Int64 = Vector.get(square, t->bishopFactor)
 
     /// `Magic.BISHOP(square).offset`.
-    pub def bishopOffset(t: Tables, square: Int32): Int32 =
-        let Tables.Tables(_, _, _, _, _, _, _, _, _, _, _, _, _, _, v) = t;
-        Vector.get(square, v)
+    @Inline
+    pub def bishopOffset(t: Tables[Static], square: Int32): Int32 = Vector.get(square, t->bishopOffset)
+
+    ///
+    /// The whole rook magic lookup.
+    ///
+    /// Scala: `ATTACKS(((magic.factor * (occupied & magic.mask)) >>> (64 - 12)).toInt + magic.offset)`.
+    ///
+    /// The `>>> (64 - 12)` is written as `>> 52` masked to twelve bits. `Bits.ushrL`
+    /// would produce the same value, but Flix does not constant-fold `64 - 12`, so
+    /// it would carry the subtraction and the mask construction into the bytecode of
+    /// every caller this is inlined into. `(p >> 52) & 0xFFF` is the same value for
+    /// every `p`: the arithmetic shift leaves bits 52..63 in the low twelve positions
+    /// with sign fill above, and the mask discards the fill. Checked against the
+    /// previous expression over 200 000 random `Int64`s and eighteen adversarial
+    /// values, for both this and the bishop's `>> 55` masked to nine bits.
+    ///
+    @Inline
+    pub def rookAttack(t: Tables[Static], square: Int32, occupied: Int64): Int64 =
+        let index = Bits.toInt(Bits.bandL(
+            Bits.shrL(Vector.get(square, t->rookFactor) * Bits.bandL(occupied, Vector.get(square, t->rookMask)), 52),
+            0xFFFi64));
+        Vector.get(index + Vector.get(square, t->rookOffset), t->attacks)
+
+    ///
+    /// The whole bishop magic lookup. See `rookAttack`; the only differences are
+    /// the three bishop vectors and the 9-bit shift.
+    ///
+    @Inline
+    pub def bishopAttack(t: Tables[Static], square: Int32, occupied: Int64): Int64 =
+        let index = Bits.toInt(Bits.bandL(
+            Bits.shrL(Vector.get(square, t->bishopFactor) * Bits.bandL(occupied, Vector.get(square, t->bishopMask)), 55),
+            0x1FFi64));
+        Vector.get(index + Vector.get(square, t->bishopOffset), t->attacks)
 }
 
 mod Bitboard {
+
+    // `lsb`/`msb` call `java.lang.Long` directly — see the note on those two
+    // functions. Flix treats every `java.lang.Long` static as *pure*, so this
+    // import buys the JIT intrinsics without an `unsafe` block, an `IO` effect or
+    // a signature change. (A doc-comment on an `import` is a parse error: imports
+    // are not declarations.)
+    import java.lang.Long
 
     ///
     /// Every square: `-1L`. Scala `Bitboard.ALL`.
@@ -456,84 +521,151 @@ mod Bitboard {
         }
     }
 
+    // Every wrapper from here to `aligned` is `@Inline`, as a family, and the
+    // annotation is load-bearing rather than decorative.
+    //
+    // These are one-line forwarders into `mod Tables`, so Flix's automatic inliner
+    // *sometimes* takes them — but only sometimes, and the rule is not the obvious
+    // one. In the round-2 jar `between`, `rays`, `knightAttacks` and `files` were
+    // inlined at every site while the structurally identical `ranks`, `kingAttacks`
+    // and `pawnAttacks` were not, and `Board.attacksToOcc` inlined its five reads
+    // while `Board.legalMoves` inlined none of them. Each refusal costs a 48-byte
+    // `dev.flix.runtime.Value$` in the callee and a ~62-bytecode trampoline
+    // (`instanceof Thunk$` loop, `instanceof Suspension$` arm, two `checkcast`s) at
+    // the call site, in the innermost loop of move generation. `@Inline` is a
+    // directive and always applies, so the family is annotated uniformly: that
+    // removes the site-dependence, and it also means an innocuous edit to one of
+    // these bodies cannot silently un-inline it.
+    //
+    // Round 1 tried exactly this and had to revert it: `flix build-jar` died with
+    // `MethodTooLargeException` inside `test/TestBitboard.flix`. The cause was the
+    // 15-field `enum` destructure, which made an inlined read 264 bytecodes; round 2
+    // made `Tables` a `struct`, so a read is now ~12 (`getfield; checkcast [J;
+    // laload`) — strictly *smaller* than the trampoline it replaces. Still gate on
+    // `flix build-jar` and never on `flix check`, which does no codegen and cannot
+    // see the 64 KB limit.
+
     ///
     /// Bishop attacks from `square` given `occupied`, via the magic table.
     ///
     /// Scala: `ATTACKS(((magic.factor * (occupied & magic.mask)) >>> (64 - 9)).toInt + magic.offset)`.
     /// The multiply wraps mod 2^64 exactly as Java's `lmul`, and `.toInt` truncates.
     ///
-    pub def bishopAttacks(t: Tables, square: Int32, occupied: Int64): Int64 = {
-        let mask = Tables.bishopMask(t, square);
-        let factor = Tables.bishopFactor(t, square);
-        let offset = Tables.bishopOffset(t, square);
-        Tables.attackAt(t, Bits.toInt(Bits.ushrL(factor * Bits.bandL(occupied, mask), 64 - 9)) + offset)
-    }
+    /// The arithmetic lives in `Tables.bishopAttack`, which reads the three magic
+    /// vectors and `ATTACKS` from a single destructure; see the note there.
+    ///
+    @Inline
+    pub def bishopAttacks(t: Tables[Static], square: Int32, occupied: Int64): Int64 =
+        Tables.bishopAttack(t, square, occupied)
 
     ///
     /// Rook attacks from `square` given `occupied`, via the magic table.
     ///
-    pub def rookAttacks(t: Tables, square: Int32, occupied: Int64): Int64 = {
-        let mask = Tables.rookMask(t, square);
-        let factor = Tables.rookFactor(t, square);
-        let offset = Tables.rookOffset(t, square);
-        Tables.attackAt(t, Bits.toInt(Bits.ushrL(factor * Bits.bandL(occupied, mask), 64 - 12)) + offset)
-    }
+    @Inline
+    pub def rookAttacks(t: Tables[Static], square: Int32, occupied: Int64): Int64 =
+        Tables.rookAttack(t, square, occupied)
 
     ///
     /// Queen attacks: Scala uses `^`, not `|`. The two sets are disjoint, so this
     /// is the same value, but the operator is kept as written.
     ///
-    pub def queenAttacks(t: Tables, square: Int32, occupied: Int64): Int64 =
+    @Inline
+    pub def queenAttacks(t: Tables[Static], square: Int32, occupied: Int64): Int64 =
         Bits.bxorL(bishopAttacks(t, square, occupied), rookAttacks(t, square, occupied))
 
     ///
     /// Pawn attacks from `square` for the given colour (`true` = white).
     ///
-    pub def pawnAttacks(t: Tables, white: Bool, square: Int32): Int64 =
+    @Inline
+    pub def pawnAttacks(t: Tables[Static], white: Bool, square: Int32): Int64 =
         if (white) Tables.whitePawnAttacks(t, square) else Tables.blackPawnAttacks(t, square)
 
     /// `Bitboard.KNIGHT_ATTACKS(square)`.
-    pub def knightAttacks(t: Tables, square: Int32): Int64 = Tables.knightAttacks(t, square)
+    @Inline
+    pub def knightAttacks(t: Tables[Static], square: Int32): Int64 = Tables.knightAttacks(t, square)
 
     /// `Bitboard.KING_ATTACKS(square)`.
-    pub def kingAttacks(t: Tables, square: Int32): Int64 = Tables.kingAttacks(t, square)
+    @Inline
+    pub def kingAttacks(t: Tables[Static], square: Int32): Int64 = Tables.kingAttacks(t, square)
 
     /// `Bitboard.BETWEEN(a)(b)`: the squares strictly between `a` and `b`, or `0`.
-    pub def between(t: Tables, a: Int32, b: Int32): Int64 = Tables.between(t, a, b)
+    @Inline
+    pub def between(t: Tables[Static], a: Int32, b: Int32): Int64 = Tables.between(t, a, b)
 
     /// `Bitboard.RAYS(a)(b)`: the whole line through `a` and `b`, or `0`.
-    pub def rays(t: Tables, a: Int32, b: Int32): Int64 = Tables.rays(t, a, b)
+    @Inline
+    pub def rays(t: Tables[Static], a: Int32, b: Int32): Int64 = Tables.rays(t, a, b)
 
     /// `Bitboard.RANKS(i)`, read from the table.
-    pub def ranks(t: Tables, i: Int32): Int64 = Tables.ranks(t, i)
+    @Inline
+    pub def ranks(t: Tables[Static], i: Int32): Int64 = Tables.ranks(t, i)
 
     /// `Bitboard.FILES(i)`, read from the table.
-    pub def files(t: Tables, i: Int32): Int64 = Tables.files(t, i)
+    @Inline
+    pub def files(t: Tables[Static], i: Int32): Int64 = Tables.files(t, i)
 
     ///
     /// Index of the least significant set bit. Undefined for `0`, which the Scala
     /// original guards with `assert`; the guard is kept.
     ///
+    /// `java.lang.Long.numberOfTrailingZeros`, not `Int64.numberOfTrailingZeros`.
+    /// The standard library's version is a *recursive per-bit scan*: it walks the
+    /// word one position at a time through `Int64.getBit`, whose `pos` argument is
+    /// a named record, so each iteration allocates a `RecordExtend` and looks the
+    /// field up by string. `lsb` runs once per set bit of every bitboard iterated
+    /// in move generation, so that cost is multiplied by everything. The Java
+    /// method is a JIT intrinsic (`TZCNT`) and is the *same call the Scala original
+    /// makes* — `src/main/scala/game/Bitboard.scala:100` is
+    /// `java.lang.Long.numberOfTrailingZeros(b)` — so the two implementations are
+    /// now identical by construction rather than merely in agreement.
+    ///
+    @Inline
     pub def lsb(b: Int64): Int32 =
         if (b == 0i64) bug!("Bitboard.lsb: empty bitboard")
-        else Int64.numberOfTrailingZeros(b)
+        else Long.numberOfTrailingZeros(b)
+
+    ///
+    /// `lsb` with the empty-bitboard guard dropped: a **precondition**, not a check.
+    ///
+    /// `lsb` is inlined at about fifteen sites in `Board`, and each copy drags the
+    /// `bug!` cold path in with it — a `ldc`, a `checkcast String`, a call to
+    /// `Def$bug$exclamation` and its full trampoline, ~70 bytecodes of code that can
+    /// never run, plus a redundant compare on every iteration. HotSpot's inlining
+    /// heuristics count total bytecode size including blocks it will never execute,
+    /// so that dead weight is what keeps `genPawnDoubles`, `genSafeKingLoop` and
+    /// friends above the threshold.
+    ///
+    /// Use this ONLY where the caller's own loop guard has just established
+    /// `b != 0` — every use in this library is the `else` arm of a literal
+    /// `if (x == 0i64) ... else { let sq = Bitboard.lsbAt(x); ... }`, so the removed
+    /// test is provably unreachable. Anywhere the bitboard could genuinely be empty
+    /// — `Board.getKing`, and the encoder's `O-O`/`O-O-O` back-rank lookup, which
+    /// `difftest`'s `ExceptionParityTest` pins — must keep `lsb`.
+    ///
+    @Inline
+    pub def lsbAt(b: Int64): Int32 = Long.numberOfTrailingZeros(b)
 
     ///
     /// Index of the most significant set bit. Undefined for `0`.
     ///
+    /// `java.lang.Long.numberOfLeadingZeros` for the reason given on `lsb`.
+    ///
+    @Inline
     pub def msb(b: Int64): Int32 =
         if (b == 0i64) bug!("Bitboard.msb: empty bitboard")
-        else 63 - Int64.numberOfLeadingZeros(b)
+        else 63 - Long.numberOfLeadingZeros(b)
 
     ///
     /// `true` if `b` has two or more squares set.
     ///
+    @Inline
     pub def moreThanOne(b: Int64): Bool =
         Bits.bandL(b, b - 1i64) != 0i64
 
     ///
     /// `true` if `sq` is a member of `b`.
     ///
+    @Inline
     pub def contains(b: Int64, sq: Int32): Bool =
         Bits.bandL(b, Bits.bit(sq)) != 0i64
 
@@ -557,6 +689,7 @@ mod Bitboard {
     /// Call sites that would say `Square.aligned(a, b, c)` in Scala say
     /// `Bitboard.aligned(t, a, b, c)` here.
     ///
-    pub def aligned(t: Tables, a: Int32, b: Int32, c: Int32): Bool =
+    @Inline
+    pub def aligned(t: Tables[Static], a: Int32, b: Int32, c: Int32): Bool =
         contains(Tables.rays(t, a, b), c)
 }

@@ -58,7 +58,7 @@ mod TestBoard {
             childLoop(b, moves, depth, i + 1, acc + perft(child, depth - 1))
         }
 
-    def boardOf(rc: Region[r], t: Tables, ps: Psqt, z: Vector[Int32], p: Pos): Board[r] \ r = {
+    def boardOf(rc: Region[r], t: Tables[Static], ps: Psqt, z: Vector[Int32], p: Pos): Board[r] \ r = {
         let (pw, kn, bi, ro, qu, ki, wh, bl, tu, ep, cr) = p;
         Board.mk(rc, t, ps, z, pw, kn, bi, ro, qu, ki, wh, bl, tu, ep, cr)
     }
@@ -1329,12 +1329,12 @@ mod TestBoard {
     /// 64 KB method limit at code generation time (`flix check` does not catch it).
     ///
     @DontInline
-    def hasEp(t: Tables, ps: Psqt, z: Vector[Int32], p: Pos): Bool =
+    def hasEp(t: Tables[Static], ps: Psqt, z: Vector[Int32], p: Pos): Bool =
         region rc { Board.hasLegalEnPassant(boardOf(rc, t, ps, z, p)) }
 
     /// `Board.isCheck` for one position; `@DontInline` for the same reason as `hasEp`.
     @DontInline
-    def isCheckAt(t: Tables, ps: Psqt, z: Vector[Int32], p: Pos): Bool =
+    def isCheckAt(t: Tables[Static], ps: Psqt, z: Vector[Int32], p: Pos): Bool =
         region rc { Board.isCheck(boardOf(rc, t, ps, z, p)) }
 
     ///
@@ -1348,7 +1348,7 @@ mod TestBoard {
 
     def checkCheck(cases: List[(String, Pos, Bool)]): Unit \ Assert = checkPredicate(isCheckAt, "isCheck", cases)
 
-    def checkPredicate(f: (Tables, Psqt, Vector[Int32], Pos) -> Bool,
+    def checkPredicate(f: (Tables[Static], Psqt, Vector[Int32], Pos) -> Bool,
                        label: String,
                        cases: List[(String, Pos, Bool)]): Unit \ Assert = {
         let t = Tables.mk();
