@@ -18,17 +18,22 @@
 ///
 /// Scala's `set` takes the whole `Board` but reads exactly three things from it —
 /// `board.turn`, `board.pawns` and `board.them()` — plus the `Bitboard` attack
-/// tables. Those three plus the tables and the piece-square table are bundled
-/// into `MoveCtx`, which is constant for the whole of one `Board.legalMoves`
-/// call, so a caller builds it once per move generation:
+/// tables and the piece-square table. Those five arrive as five leading scalar
+/// parameters:
 ///
 /// ```flix
-/// let ctx = MoveCtx.mk(tables, psqt, turn, pawns, them);
-/// let m   = Move.mk(ctx, Move.normal(), Role.Knight, from, capture, to, None);
+/// let m = Move.mk(tables, psqt, turn, pawns, them,
+///                 Move.normal(), Role.Knight, from, capture, to, None);
 /// ```
 ///
-/// `Board` may of course wrap that in a helper; the contract this file fixes is
-/// the five values in `MoveCtx` and the argument order of `Move.mk`.
+/// They used to be bundled into a single-case `MoveCtx` enum built once per
+/// `Board.legalMoves` call. That enum was deleted: a single-case enum is a heap
+/// object, it was allocated once per ply on every path (decode, encode and every
+/// perft node) for 48 B/ply, and a destructure of it materialises every field
+/// anyway. Passing the five values individually is the same five values by a
+/// different route and allocates nothing. Do NOT "simplify" this back by passing
+/// the `Board` itself — that would make `Move.mk` effectful and cost a `Value$`
+/// box on every generated move.
 ///
 /// # Fidelity notes
 ///
@@ -141,65 +146,6 @@ mod Psqt {
 }
 
 ///
-/// Everything `Move.set` reads out of the `Board`, plus the two static tables.
-///
-/// Fields, in order:
-///
-/// ```
-///   0  tables   the `Bitboard` attack tables (for `Bitboard.pawnAttacks`)
-///   1  psqt     the piece-square table
-///   2  turn     Scala `board.turn`   -- true = white to move
-///   3  pawns    Scala `board.pawns`  -- all pawns of both colours
-///   4  them     Scala `board.them()` -- every piece of the side NOT to move
-/// ```
-///
-/// All five are constant across one `Board.legalMoves` call, so build one
-/// `MoveCtx` per move generation and reuse it for every push.
-///
-pub enum MoveCtx {
-    case MoveCtx(Tables[Static], Psqt, Bool, Int64, Int64)
-}
-
-mod MoveCtx {
-
-    ///
-    /// Bundles the scoring inputs. Pure.
-    ///
-    pub def mk(tables: Tables[Static], psqt: Psqt, turn: Bool, pawns: Int64, them: Int64): MoveCtx =
-        MoveCtx.MoveCtx(tables, psqt, turn, pawns, them)
-
-    /// The attack tables.
-    @Inline
-    pub def tables(c: MoveCtx): Tables[Static] =
-        let MoveCtx.MoveCtx(t, _, _, _, _) = c;
-        t
-
-    /// The piece-square table.
-    @Inline
-    pub def psqt(c: MoveCtx): Psqt =
-        let MoveCtx.MoveCtx(_, p, _, _, _) = c;
-        p
-
-    /// Scala `board.turn`.
-    @Inline
-    pub def turn(c: MoveCtx): Bool =
-        let MoveCtx.MoveCtx(_, _, b, _, _) = c;
-        b
-
-    /// Scala `board.pawns`.
-    @Inline
-    pub def pawns(c: MoveCtx): Int64 =
-        let MoveCtx.MoveCtx(_, _, _, p, _) = c;
-        p
-
-    /// Scala `board.them()`.
-    @Inline
-    pub def them(c: MoveCtx): Int64 =
-        let MoveCtx.MoveCtx(_, _, _, _, x) = c;
-        x
-}
-
-///
 /// A move: `type`, `role`, `from`, `capture`, `to`, `promotion`, `score` — the
 /// seven fields of the Scala class, packed into one `Int64`.
 ///
@@ -290,15 +236,17 @@ mod Move {
     /// ```
     ///
     @Inline
-    pub def mk(ctx: MoveCtx, moveType: Int32, role: Role, fromSq: Int32, capture: Bool,
+    pub def mk(tables: Tables[Static], psqt: Psqt, turn: Bool, pawns: Int64, them: Int64,
+               moveType: Int32, role: Role, fromSq: Int32, capture: Bool,
                toSq: Int32, promotion: Option[Role]): Move = {
-        // ONE destructure, not five accessor calls. Flix materialises every field
-        // of a single-case enum on every destructure and appends a provably dead
-        // `MatchError$`/`ReifiedSourceLocation$` branch, so the five `@Inline`d
-        // `MoveCtx.*` accessors plus the two inside `pieceValue` expanded to eight
-        // copies of the same five field loads — about half of this function's
-        // 2233 bytecodes, on a function called once per generated move.
-        let MoveCtx.MoveCtx(tables, psqt, turn, pawns, them) = ctx;
+        // The five scoring inputs arrive already unpacked. They used to arrive as one
+        // `MoveCtx` enum, and this function opened it with a single destructure
+        // rather than five accessor calls, because Flix materialises every field of a
+        // single-case enum on every destructure and appends a provably dead
+        // `MatchError$`/`ReifiedSourceLocation$` branch — the five `@Inline`d
+        // accessors plus the two inside `pieceValue` had expanded to eight copies of
+        // the same five field loads, about half of this function's 2233 bytecodes.
+        // With the enum gone there is nothing left to destructure.
         let defendingPawns =
             Bits.bandL(
                 Bits.bandL(

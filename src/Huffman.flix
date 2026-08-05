@@ -52,7 +52,7 @@ mod Huffman {
     /// caller can build them once and hold them.
     ///
     pub enum HuffmanTable {
-        case HuffmanTable(Vector[Symbol], Node)
+        case HuffmanTable(Vector[Symbol], Node, Vector[Int32])
     }
 
     ///
@@ -61,14 +61,60 @@ mod Huffman {
     ///
     pub def mkTable(): HuffmanTable =
         let cs = codes();
-        HuffmanTable.HuffmanTable(cs, buildTree(cs, 0, 0))
+        HuffmanTable.HuffmanTable(cs, buildTree(cs, 0, 0), mkLut(cs))
+
+    ///
+    /// The 512-entry first-9-bits lookup table that `read` decodes through.
+    ///
+    /// Entry = `(symbol << 5) | bits` for every code of at most 9 bits, and `-1` for
+    /// a 9-bit prefix that belongs to a longer code and must fall back to the tree.
+    ///
+    /// # Why 9 bits, and why one level
+    ///
+    /// The table is a complete prefix code (Kraft sum exactly 1) with lengths 2..31,
+    /// average 4.41 bits by the published frequencies. Filling every code of at most
+    /// K bits into its `2^(K-bits)` slots leaves, at K = 9, exactly TWO escape slots
+    /// out of 512 — indices `0b110001000` and `0b111000110` — which is 0.39% of the
+    /// code space and 0.428% by symbol frequency. K = 8 leaves 3 slots / 1.25% and
+    /// K = 7 leaves 3 / 2.52%. At an escape rate that low a second level buys
+    /// nothing, so this stays a single flat `Vector[Int32]`.
+    ///
+    /// The code is NOT canonical (codes are not consecutive within a length), so the
+    /// first-code/offset trick does not apply; a direct fill does, and it is built
+    /// from the same 256 `(code, bits)` pairs `buildTree` reads, once, at table
+    /// construction.
+    ///
+    pub def mkLut(cs: Vector[Symbol]): Vector[Int32] = region rc {
+        let lut = Array.repeat(rc, 512, -1);
+        def outer(i) = {
+            if (i <= 0xff) {
+                match Vector.get(i, cs) {
+                    case Symbol.Symbol(code, bits) =>
+                        if (bits <= 9) {
+                            let base = Bits.shl(code, 9 - bits);
+                            let n = Bits.shl(1, 9 - bits);
+                            def inner(j) = {
+                                if (j < n) {
+                                    Array.put(Bits.bor(Bits.shl(i, 5), bits), base + j, lut);
+                                    inner(j + 1)
+                                } else ()
+                            };
+                            inner(0)
+                        } else ()
+                };
+                outer(i + 1)
+            } else ()
+        };
+        outer(0);
+        Array.toVector(lut)
+    }
 
     ///
     /// `write(value, writer)`: emit the code for `value` in `CODES`.
     ///
     pub def write(t: HuffmanTable, value: Int32, w: BitWriter[r]): Unit \ r = {
         match t {
-            case HuffmanTable.HuffmanTable(cs, _) => match Vector.get(value, cs) {
+            case HuffmanTable.HuffmanTable(cs, _, _) => match Vector.get(value, cs) {
                 case Symbol.Symbol(code, bits) => BitWriter.writeBits(code, bits, w)
             }
         };
@@ -78,12 +124,45 @@ mod Huffman {
     }
 
     ///
-    /// `read(reader)`: walk the decoding tree one bit at a time until a leaf.
+    /// `read(reader)`: the next symbol.
+    ///
+    /// # This is a different ALGORITHM from the Scala original, deliberately
+    ///
+    /// The original walks the `Node` tree one bit at a time, which is a dependent
+    /// pointer load and a `readBits(1)` call per bit — 4.41 of each per ply on
+    /// average, and the Scala side pays exactly the same. Here, one peek at the next
+    /// nine bits indexes `mkLut` and returns the symbol and its length directly; only
+    /// the 0.428% of symbols whose code is longer than nine bits fall back to
+    /// `traverse` from the root, with nothing consumed.
+    ///
+    /// Decode's contract is the SYMBOLS it produces, so a different decoding
+    /// algorithm changes no emitted byte: `write` is untouched and the 256-entry
+    /// `Symbol` vector and `buildTree` are exactly as they were. The table is filled
+    /// from those same `(code, bits)` pairs, so the fast path returns the leaf the
+    /// walk would have reached and consumes the same number of bits.
+    ///
+    /// # End of stream
+    ///
+    /// `peekNine` zero-pads past the end of the byte array rather than throwing, and
+    /// that is safe rather than lucky. If the padding zeros are load-bearing then the
+    /// matched code is longer than the bits that exist, and the following `skipBits`
+    /// takes the same `readNext` -> `getUnsigned` path the bit-at-a-time walk would
+    /// have taken and raises the same `BufferUnderflowException`. If a code is
+    /// matched within the bits that do exist, those bits are all real and the answer
+    /// is the walk's answer. `TestHuffmanSelf.testRoundTripAll` writes all 256
+    /// symbols back to back — every code length including the 30- and 31-bit ones,
+    /// every word straddle and the ragged tail — and reads them all back.
     ///
     @Inline
     pub def read(t: HuffmanTable, rd: BitReader[r]): Int32 \ r =
         match t {
-            case HuffmanTable.HuffmanTable(_, root) => traverse(root, rd)
+            case HuffmanTable.HuffmanTable(_, root, lut) =>
+                let e = Vector.get(BitReader.peekNine(rd), lut);
+                if (e >= 0) {
+                    BitReader.skipBits(Bits.band(e, 31), rd);
+                    Bits.ushr(e, 5)
+                } else
+                    traverse(root, rd)
         }
 
     ///

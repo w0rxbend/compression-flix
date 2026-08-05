@@ -151,4 +151,9 @@ public final class LichessFlixCodec implements FlixCodec {
     public int resultIncrementalHash(java.lang.Object result) {
         return Api.resultIncrementalHash(result);
     }
+
+    @Override
+    public boolean resultInto(java.lang.Object result, long[] longs, java.lang.Object[] refs) {
+        return Api.resultInto(result, longs, refs);
+    }
 }

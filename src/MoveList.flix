@@ -48,14 +48,15 @@
 ///
 /// Scala's `pushNormal(board, ...)` passes the whole `Board`; `Move.set` reads
 /// `turn`, `pawns` and `them()` from it. Here those three, plus the attack tables
-/// and the piece-square table, are bundled in a `MoveCtx` (see `Move.flix`) which
-/// the caller builds once per `legalMoves` call:
+/// and the piece-square table, are passed as five leading scalars — see the note on
+/// `Move.mk` in `Move.flix` for why they are not bundled into a context object and
+/// not read off the `Board`:
 ///
 /// ```flix
 /// region rc {
 ///     let moves = MoveList.mk(rc, 256);
-///     let ctx   = MoveCtx.mk(tables, psqt, turn, pawns, them);
-///     MoveList.pushNormal(moves, ctx, Role.Knight, from, capture, to);
+///     MoveList.pushNormal(moves, tables, psqt, turn, pawns, them,
+///                         Role.Knight, from, capture, to);
 ///     ...
 /// }
 /// ```
@@ -79,7 +80,7 @@ mod MoveList {
     /// `MoveList.mk(rc, 2)` for the throwaway list in `hasLegalEnPassant`.
     ///
     pub def mk(rc: Region[r], capacity: Int32): MoveList[r] \ r =
-        new MoveList @ rc { buffer = Array.repeat(rc, capacity, Move.empty()), size = 0 }
+        new MoveList @ rc { buffer = Array.empty(rc, capacity), size = 0 }
 
     ///
     /// Scala `MoveList()`: the default capacity of 256.
@@ -152,9 +153,10 @@ mod MoveList {
     /// Scala `pushNormal(board, role, from, capture, to)`.
     ///
     @Inline
-    pub def pushNormal(ml: MoveList[r], ctx: MoveCtx, role: Role, fromSq: Int32,
+    pub def pushNormal(ml: MoveList[r], tables: Tables[Static], psqt: Psqt, turn: Bool,
+                       pawns: Int64, them: Int64, role: Role, fromSq: Int32,
                        capture: Bool, toSq: Int32): Unit \ r =
-        push(ml, Move.mk(ctx, Move.normal(), role, fromSq, capture, toSq, None))
+        push(ml, Move.mk(tables, psqt, turn, pawns, them, Move.normal(), role, fromSq, capture, toSq, None))
 
     ///
     /// Scala `pushPromotion(board, from, capture, to, promotion)`.
@@ -163,24 +165,27 @@ mod MoveList {
     /// the original says.
     ///
     @Inline
-    pub def pushPromotion(ml: MoveList[r], ctx: MoveCtx, fromSq: Int32, capture: Bool,
+    pub def pushPromotion(ml: MoveList[r], tables: Tables[Static], psqt: Psqt, turn: Bool,
+                          pawns: Int64, them: Int64, fromSq: Int32, capture: Bool,
                           toSq: Int32, promotion: Role): Unit \ r =
-        push(ml, Move.mk(ctx, Move.normal(), Role.Pawn, fromSq, capture, toSq, Some(promotion)))
+        push(ml, Move.mk(tables, psqt, turn, pawns, them, Move.normal(), Role.Pawn, fromSq, capture, toSq, Some(promotion)))
 
     ///
     /// Scala `pushCastle(board, king, rook)`: `to` is the **rook** square, and
     /// `capture` is false even though the rook square is occupied.
     ///
     @Inline
-    pub def pushCastle(ml: MoveList[r], ctx: MoveCtx, king: Int32, rook: Int32): Unit \ r =
-        push(ml, Move.mk(ctx, Move.castling(), Role.King, king, false, rook, None))
+    pub def pushCastle(ml: MoveList[r], tables: Tables[Static], psqt: Psqt, turn: Bool,
+                       pawns: Int64, them: Int64, king: Int32, rook: Int32): Unit \ r =
+        push(ml, Move.mk(tables, psqt, turn, pawns, them, Move.castling(), Role.King, king, false, rook, None))
 
     ///
     /// Scala `pushEnPassant(board, capturer, to)`: `capture` is true.
     ///
     @Inline
-    pub def pushEnPassant(ml: MoveList[r], ctx: MoveCtx, capturer: Int32, toSq: Int32): Unit \ r =
-        push(ml, Move.mk(ctx, Move.enPassant(), Role.Pawn, capturer, true, toSq, None))
+    pub def pushEnPassant(ml: MoveList[r], tables: Tables[Static], psqt: Psqt, turn: Bool,
+                          pawns: Int64, them: Int64, capturer: Int32, toSq: Int32): Unit \ r =
+        push(ml, Move.mk(tables, psqt, turn, pawns, them, Move.enPassant(), Role.Pawn, capturer, true, toSq, None))
 
     ///
     /// Scala `def find(predicate): Option[Move]` over the live prefix.
@@ -293,44 +298,134 @@ mod MoveList {
     /// `bug!`. This is the site a corrupt stream actually reaches: a Huffman
     /// symbol larger than the number of legal moves in the position.
     ///
+    /// # The small-rank fast path (round 6)
+    ///
+    /// A *different selection algorithm* is legitimate here in a way it would not
+    /// be on the encode side, and the argument is a proof rather than a
+    /// measurement. `Move.score` packs five bit-disjoint fields —
+    /// `(promo<<26) + (capture<<25) + (pawnDefFlag<<22) + ((512+moveValue)<<12) +
+    /// (to<<6) + from`, with `512+moveValue` in `[412, 612] < 2^10` — so bits 0..11
+    /// are `(to, from)`, which names a move uniquely except for promotion variants,
+    /// and those differ in bits >= 26. Scores are therefore **injective within one
+    /// legal move list** (checked: 0 duplicates over 206 604 lists / 5 072 212 moves
+    /// in an exhaustive depth-4 walk, and 0 over the 2 054 lists the corpus decode
+    /// visits). Injectivity makes the `(rank+1)`-th largest *unique*, so any correct
+    /// selection returns the same `Move`, and `selectRank` has exactly one caller in
+    /// the repository — `GameEncoder.decodeLoop`. Encode uses `find` + `rank`, and
+    /// perft never calls it. No emitted byte can move.
+    ///
+    /// The permutation quickselect leaves behind is likewise unobservable: after
+    /// `selectRank` the only reads of `legals` are `GameEncoder.othersLoop` (an
+    /// order-independent OR-reduction over `[0, size)`) and `MoveList.isEmpty`
+    /// (which reads `size`), and the next ply's `legalMoves` calls `clear`.
+    ///
+    /// Why it is faster: instrumented over the corpus, the Lomuto quickselect does
+    /// 63.6-73.2 partition steps per ply against a mean list size of 27.1-32.9, and
+    /// its inner branch is ~50% unpredictable by construction. The mean rank is
+    /// 7.6-8.6 and 60-63% of ranks are below 8, so a single pass keeping the best
+    /// four in four `Int64` scalars — one almost-always-taken threshold branch —
+    /// serves about half of all plies with one pass and no mispredicts.
+    ///
+    /// The cutoff is 4 and not larger on purpose: a cutoff-8 variant needs a scratch
+    /// array (+144 B per decode, against allocation rows that are also targets) and a
+    /// cutoff-16 variant measured 0.988x/0.982x/0.985x, i.e. top-k-always loses.
+    ///
     @Inline
     pub def selectRank(ml: MoveList[r], targetRank: Int32): Move \ r =
         if (targetRank < 0 or targetRank >= ml->size)
             unsafe IO { throw new IllegalArgumentException("requirement failed") }
+        else if (targetRank < 4)
+            top4Loop(ml->buffer, ml->size, 0, sentinel(), sentinel(), sentinel(), sentinel(), targetRank)
         else
             selectLoop(ml, targetRank, 0, ml->size - 1)
 
-    def selectLoop(ml: MoveList[r], targetRank: Int32, left: Int32, right: Int32): Move \ r =
-        if (left < right) {
-            let p = partition(ml, left, right);
-            if (p == targetRank) at(ml, targetRank)
-            else if (p < targetRank) selectLoop(ml, targetRank, p + 1, right)
-            else selectLoop(ml, targetRank, left, p - 1)
-        } else
-            at(ml, targetRank)
+    ///
+    /// A `Move` whose score field is `Int32.MinValue` and which therefore sorts
+    /// *after* every real move under `Move.lessThan`.
+    ///
+    /// `lessThan(x, y)` is `y << 32 < x << 32`. `sentinel() << 32` is exactly
+    /// `Int64.MinValue`, and a real move's score is in `[0, 2^29)` so its `<< 32` is
+    /// non-negative; hence `lessThan(real, sentinel())` holds for every real move and
+    /// a sentinel is always displaced before it can be returned. It never can be
+    /// returned anyway: the guard above has already established `targetRank < size`,
+    /// so at least `targetRank + 1` real moves pass through the loop.
+    ///
+    @Inline
+    def sentinel(): Move = -2147483648i64
 
     ///
-    /// Scala `private def partition(left, right): Int` — the Lomuto scheme.
+    /// One pass over `buffer[0, size)` keeping the four moves that sort first under
+    /// `Move.lessThan` in `a <= b <= c <= d`, then returning the `target`-th.
     ///
-    /// The Scala pivot is the *reference* `buffer(right)`, but `right` is never
-    /// touched by the inner loop's swaps (which only involve indices in
-    /// `[left, right)`), so capturing the value here is equivalent.
+    /// Self-tail-recursive in all five arms, so Flix compiles it to a `goto` loop;
+    /// `Move.lessThan` is `@Inline` and every accumulator is an `Int64` local, so the
+    /// loop allocates nothing (one `Value$` at the single exit). Contrast the path it
+    /// replaces: `selectLoopOn` calls `partitionLoopOn` as a real Flix def, paying a
+    /// `Result$` trampoline round trip and an `Int32` `Value$` per quickselect level.
     ///
-    def partition(ml: MoveList[r], left: Int32, right: Int32): Int32 \ r = {
-        let pivot = at(ml, right);
-        let i = partitionLoop(ml, pivot, left, right, left - 1) + 1;
-        swap(ml, i, right);
-        i
-    }
+    def top4Loop(buf: Array[Move, r], size: Int32, i: Int32,
+                 a: Move, b: Move, c: Move, d: Move, target: Int32): Move \ r =
+        if (i >= size)
+            (if (target == 0) a else if (target == 1) b else if (target == 2) c else d)
+        else {
+            let v = Array.get(i, buf);
+            if (not Move.lessThan(v, d))       top4Loop(buf, size, i + 1, a, b, c, d, target)
+            else if (Move.lessThan(v, a))      top4Loop(buf, size, i + 1, v, a, b, c, target)
+            else if (Move.lessThan(v, b))      top4Loop(buf, size, i + 1, a, v, b, c, target)
+            else if (Move.lessThan(v, c))      top4Loop(buf, size, i + 1, a, b, v, c, target)
+            else                               top4Loop(buf, size, i + 1, a, b, c, v, target)
+        }
+
+    ///
+    /// The quickselect and its Lomuto `partition` are fused into two defs over the raw
+    /// `Array[Move, r]` rather than three defs over the `MoveList` struct.
+    ///
+    /// Scala's `selectRank` / `partition` are two methods on one object, so the field
+    /// load is free there; here `ml->buffer` was a `getfield` plus a `checkcast [J`
+    /// reloaded five times per swapping iteration (once in the pivot read, twice in
+    /// each `at`, twice more in `swap`), and `selectLoop -> partition -> partitionLoop`
+    /// cost two `Result$` trampoline round trips per quickselect level. `partitionLoop`
+    /// is the #2 frame in the port's decode profile at ~22% of samples, so both matter.
+    ///
+    /// The swap sequence is preserved exactly — same last-element pivot, same Lomuto
+    /// scan, same `i + 1` then `swap(i, right)` — because that sequence is what resolves
+    /// ties, and a different permutation would change which move a given Huffman rank
+    /// names. Gated on the depth-4 perft checksum, which is move-order sensitive, as
+    /// well as on `difftest`.
+    ///
+    /// The Scala pivot is the *reference* `buffer(right)`, but `right` is never touched
+    /// by the inner loop's swaps (which only involve indices in `[left, right)`), so
+    /// capturing the value is equivalent.
+    ///
+    def selectLoop(ml: MoveList[r], targetRank: Int32, left: Int32, right: Int32): Move \ r =
+        selectLoopOn(ml->buffer, targetRank, left, right)
+
+    def selectLoopOn(buf: Array[Move, r], targetRank: Int32, left: Int32, right: Int32): Move \ r =
+        if (left < right) {
+            let pivot = Array.get(right, buf);
+            let i = partitionLoopOn(buf, pivot, left, right, left - 1) + 1;
+            // swap(i, right)
+            let tmp = Array.get(i, buf);
+            Array.put(Array.get(right, buf), i, buf);
+            Array.put(tmp, right, buf);
+            if (i == targetRank) Array.get(targetRank, buf)
+            else if (i < targetRank) selectLoopOn(buf, targetRank, i + 1, right)
+            else selectLoopOn(buf, targetRank, left, i - 1)
+        } else
+            Array.get(targetRank, buf)
 
     /// The `for j <- left until right` loop; returns the final `i`.
-    def partitionLoop(ml: MoveList[r], pivot: Move, j: Int32, right: Int32, i: Int32): Int32 \ r =
+    def partitionLoopOn(buf: Array[Move, r], pivot: Move, j: Int32, right: Int32, i: Int32): Int32 \ r =
         if (j >= right) i
-        else if (Move.lessThan(at(ml, j), pivot)) {
-            swap(ml, i + 1, j);
-            partitionLoop(ml, pivot, j + 1, right, i + 1)
+        else if (Move.lessThan(Array.get(j, buf), pivot)) {
+            let k = i + 1;
+            // swap(k, j)
+            let tmp = Array.get(k, buf);
+            Array.put(Array.get(j, buf), k, buf);
+            Array.put(tmp, j, buf);
+            partitionLoopOn(buf, pivot, j + 1, right, k)
         } else
-            partitionLoop(ml, pivot, j + 1, right, i)
+            partitionLoopOn(buf, pivot, j + 1, right, i)
 
     ///
     /// Scala `def pretty(): String` — every live move's UCI, each followed by a

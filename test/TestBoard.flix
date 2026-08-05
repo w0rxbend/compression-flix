@@ -45,7 +45,7 @@ mod TestBoard {
     def perft(b: Board[r], depth: Int32): Int64 \ r =
         if (depth >= 1) region rc {
             let moves = MoveList.mkDefault(rc);
-            Board.legalMoves(b, moves);
+            discard Board.legalMoves(b, moves);
             if (depth == 1) Int32.toInt64(MoveList.getSize(moves))
             else childLoop(b, moves, depth, 0, 0i64)
         } else 1i64
@@ -85,13 +85,13 @@ mod TestBoard {
     def legalUci(p: Pos): List[String] = region rc {
         let b = boardOf(rc, Tables.mk(), Psqt.mk(), ZobristHash.polyglot(), p);
         let moves = MoveList.mkDefault(rc);
-        Board.legalMoves(b, moves);
+        discard Board.legalMoves(b, moves);
         List.sort(List.map(Move.uci, MoveList.toList(moves)))
     }
 
     def findUci(b: Board[r], u: String): Move \ r = region rc {
         let moves = MoveList.mkDefault(rc);
-        Board.legalMoves(b, moves);
+        discard Board.legalMoves(b, moves);
         match MoveList.find(moves, m -> Move.uci(m) == u) {
             case Some(m) => m
             case None    => bug!("TestBoard.findUci: no legal move ${u}")

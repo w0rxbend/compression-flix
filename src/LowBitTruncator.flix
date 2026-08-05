@@ -54,31 +54,29 @@ mod LowBitTruncator {
     /// This is `LowBitTruncator.writeDigits(centis, writer)` from the Scala original,
     /// and is the only public entry point, matching the Scala surface.
     ///
+    /// The bit sink used to be injected as a `(data, numBits)` callback, which was a
+    /// leftover of the port order — `LowBitTruncator` was written before `BitOps`
+    /// existed. It cost, per encode, three heap allocations and four dispatches for
+    /// what is semantically one 3-bit write: the effect-polymorphic parameter forced
+    /// Flix to materialise a resumable `Frame$` closure for the final call (which is
+    /// in tail position, so it was not defunctionalised the way the loop's was),
+    /// `getUniqueThreadClosure()` copied it, and `applyFrame` then allocated a
+    /// `BitWriter/Def$writeBits` thunk of its own. The sequence, count and order of
+    /// `writeBits` calls here is exactly what the callback form produced.
     pub def writeDigits(centis: Array[Int32, r1], w: BitWriter[r2]): Unit \ (r1 + r2) =
-        writeDigitsWith(centis, (data, numBits) -> BitWriter.writeBits(data, numBits, w))
-
-    ///
-    /// `writeDigits` with the bit sink supplied as a `(data, numBits)` callback.
-    ///
-    /// This indirection is a leftover of the port order: `LowBitTruncator` was written
-    /// before `BitOps` existed, so the sink had to be injected. It is kept because the
-    /// control flow can be exercised without a real `BitWriter`, but it is now
-    /// module-private — the sequence and order of `writeBits` calls is identical
-    /// either way, so `writeDigits` above is the entry point callers want.
-    ///
-    def writeDigitsWith(centis: Array[Int32, r], writeBits: (Int32, Int32) -> Unit \ ef): Unit \ r + ef =
         let maxIdx = Array.length(centis) - 1;
-        writeDigitsFrom(centis, writeBits, 0, maxIdx);
-        writeBits(Array.get(maxIdx, centis), 3)
+        writeDigitsFrom(centis, w, 0, maxIdx);
+        BitWriter.writeBits(Array.get(maxIdx, centis), 3, w);
+        ()   // keeps `writeBits` out of tail position; see the note in `mod Board`
 
-    def writeDigitsFrom(centis: Array[Int32, r], writeBits: (Int32, Int32) -> Unit \ ef, i: Int32, maxIdx: Int32): Unit \ r + ef =
+    def writeDigitsFrom(centis: Array[Int32, r1], w: BitWriter[r2], i: Int32, maxIdx: Int32): Unit \ (r1 + r2) =
         if (i < maxIdx) {
             let centi = Array.get(i, centis);
             if (centi < centiCutoff())
-                writeBits(centi, 3)
+                BitWriter.writeBits(centi, 3, w)
             else
                 ();
-            writeDigitsFrom(centis, writeBits, i + 1, maxIdx)
+            writeDigitsFrom(centis, w, i + 1, maxIdx)
         } else
             ()
 
@@ -95,9 +93,20 @@ mod LowBitTruncator {
     ///
     /// `decode` with the bit source supplied as a `numReqBits -> Int32` callback.
     ///
-    /// Module-private, for the same reason as `writeDigitsWith` above. It is only
-    /// invoked on the branches where the original calls `reader.readBits`, so the
-    /// number and order of reads is unchanged.
+    /// It is only invoked on the branches where the original calls `reader.readBits`,
+    /// so the number and order of reads is unchanged.
+    ///
+    /// THIS SIDE KEEPS THE CALLBACK AND THAT IS A MEASURED DECISION. The symmetric
+    /// change was made to `writeDigits` above and won there (clock encode
+    /// 1.364/1.319/1.262x -> 1.294/1.257/1.198x); the same change here LOST, and by
+    /// more than it won on encode: clock decode 1.148/1.174/1.286x -> 1.233/1.298/1.214x,
+    /// i.e. +5.5 ns on the short band and +11 ns on the median against error bars of
+    /// 2-3 ns. Flix already defunctionalises this side — the `readBits` calls are not
+    /// in tail position, so no `Frame$` closure is materialised the way `writeDigits`'
+    /// final call materialised one — so there was no allocation to win back, and
+    /// calling `BitReader.readBits` directly from `decodeFrom` evidently costs
+    /// HotSpot an inlining decision it was previously making. Do not "finish the job"
+    /// here without re-measuring.
     ///
     def decodeWith(trunced: Array[Int32, r], readBits: Int32 -> Int32 \ ef): Unit \ r + ef =
         let maxIdx = Array.length(trunced) - 1;

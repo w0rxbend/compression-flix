@@ -96,7 +96,7 @@ mod PerftSweep {
         if (depth < 1) (1i64, h0)
         else region rc {
             let moves = MoveList.mkDefault(rc);
-            Board.legalMoves(b, moves);
+            discard Board.legalMoves(b, moves);
             let n = MoveList.getSize(moves);
             let hM = mixLoop(moves, n, 0, h0);
             let h1 = Bits.bxorL(Bits.shlL(hM, 5) + hM, Int32.toInt64(n));

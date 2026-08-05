@@ -54,6 +54,7 @@
 mod Api {
 
     import java.lang.Object
+    import java.lang.Integer
     import java.lang.NegativeArraySizeException
 
     ///
@@ -167,7 +168,7 @@ mod Api {
         if (plies < 0) throw new NegativeArraySizeException(Int32.toString(plies)) else ();
         let gt: GameTables = unchecked_cast(tables as GameTables);
         let bytes: Array[Int8, Static] = unchecked_cast(input as Array[Int8, Static]);
-        unchecked_cast(GameEncoder.decode(Static, gt, Array.toVector(bytes), plies) as Object)
+        unchecked_cast(GameEncoder.decode(Static, gt, bytes, plies) as Object)
 
     // --------------------------------------------------------- decode accessors
 
@@ -175,10 +176,18 @@ mod Api {
     /// Scala `DecodeResult.pgnMoves`: the replayed SAN tokens as a Java `String[]`
     /// of length `plies`, check and mate suffixes included.
     ///
+    /// Hands back the decoder's own array rather than a copy, which is what the Scala
+    /// original does (`game/Encoder.scala` returns `output` directly). It is
+    /// therefore an aliasing change only relative to the previous version of this
+    /// port, not relative to the reference implementation.
+    ///
+    /// Pure — it only reads an already-materialised field — so it must not declare
+    /// `\ IO`, which Flix would reject as unused.
+    ///
     @Export
-    pub def resultPgnMoves(result: Object): Object \ IO =
+    pub def resultPgnMoves(result: Object): Object =
         let r: DecodeResult[Static] = unchecked_cast(result as DecodeResult[Static]);
-        unchecked_cast(Vector.toArray(Static, DecodeResult.pgnMoves(r)) as Object)
+        unchecked_cast(DecodeResult.pgnMoves(r) as Object)
 
     ///
     /// Scala `DecodeResult.halfMoveClock`: plies since the last pawn move or
@@ -196,10 +205,14 @@ mod Api {
     /// Scala `DecodeResult.positionHashes`: three bytes per position, most recent
     /// first, back to the last irreversible move. A Java `byte[]`.
     ///
+    /// This is already a fresh slice of the decoder's hash buffer (`sliceBytes`), so
+    /// handing it back uncopied costs the caller nothing and matches the original's
+    /// single `Arrays.copyOfRange`. Pure, hence no `\ IO`.
+    ///
     @Export
-    pub def resultPositionHashes(result: Object): Object \ IO =
+    pub def resultPositionHashes(result: Object): Object =
         let r: DecodeResult[Static] = unchecked_cast(result as DecodeResult[Static]);
-        unchecked_cast(Vector.toArray(Static, DecodeResult.positionHashes(r)) as Object)
+        unchecked_cast(DecodeResult.positionHashes(r) as Object)
 
     ///
     /// Scala `DecodeResult.lastUci`: the final move in UCI notation ("e2e4",
@@ -367,4 +380,79 @@ mod Api {
     pub def resultIncrementalHash(result: Object): Int32 \ IO =
         let r: DecodeResult[Static] = unchecked_cast(result as DecodeResult[Static]);
         Board.incrementalHash(DecodeResult.board(r))
+
+    ///
+    /// The seventeen accessors above, in one call, into caller-supplied arrays.
+    ///
+    /// ## Why this exists
+    ///
+    /// Every `@Export`ed Flix def compiles to a shim that allocates a `Def$` closure
+    /// holding the arguments, drives a `Thunk$.invoke()` trampoline, and unwraps a
+    /// `dev.flix.runtime.Value$` — a universal box with `b/c/i8/i16/i32/i64/f32/f64/o`
+    /// fields, 48 bytes. Measured over a 200 000-call loop on a single fixed handle
+    /// (the case most favourable to escape analysis, and escape analysis still fails
+    /// because `Thunk$.invoke()` is megamorphic across the thousands of `Thunk$`
+    /// implementations in the jar), each of the sixteen `Object`/`Int64`/`Int32`
+    /// accessors costs 64 B — a 16 B `Def$` plus the 48 B `Value$` — and the facade
+    /// makes all seventeen per decode: **1,040 B per `decode` call**, against a decode
+    /// that legitimately allocates about 58 B per ply.
+    ///
+    /// `Bool` is the return type on purpose and it is the whole trick: `Value$.TRUE`
+    /// and `Value$.FALSE` are public static finals, so a `Bool`-returning export is the
+    /// one shape that skips the box. `resultTurn` above costs 16 B rather than 64 B for
+    /// exactly this reason, and it is what suggested the fix. `Unit` would be tidier
+    /// still and is not available: it is not an exportable return type (Entry Point
+    /// Error E1396).
+    ///
+    /// The seventeen stay. They are documented API, `difftest` and `FlixGameBench`
+    /// call them, and they are the readable way to pull one field.
+    ///
+    /// ## Layout
+    ///
+    /// `longs` must have length >= 14 and `refs` length >= 3.
+    ///
+    ///   longs[0..7]  pawns, knights, bishops, rooks, queens, kings, white, black
+    ///   longs[8]     turn, as 1 for White to move and 0 for Black
+    ///   longs[9]     epSquare        (zero-extended from Int32)
+    ///   longs[10]    castlingRights
+    ///   longs[11]    occupied
+    ///   longs[12]    incrementalHash (zero-extended from Int32 — the caller must
+    ///                                narrow with a cast, or lose the sign bit)
+    ///   longs[13]    halfMoveClock   (zero-extended from Int32)
+    ///   refs[0]      pgnMoves        (java.lang.String[])
+    ///   refs[1]      positionHashes  (byte[])
+    ///   refs[2]      lastUci         (java.lang.String, or a genuine null)
+    ///
+    /// `Integer.toUnsignedLong` is the zero-extending widening; the sign-extending one
+    /// would be indistinguishable for `epSquare` and `halfMoveClock` but would not
+    /// round-trip `incrementalHash`, whose top bit is live. Always returns `true`.
+    ///
+    @Export
+    pub def resultInto(result: Object, longs: Object, refs: Object): Bool \ IO =
+        let r: DecodeResult[Static] = unchecked_cast(result as DecodeResult[Static]);
+        let ls: Array[Int64, Static] = unchecked_cast(longs as Array[Int64, Static]);
+        let rs: Array[Object, Static] = unchecked_cast(refs as Array[Object, Static]);
+        let b = DecodeResult.board(r);
+        Array.put(Board.pawns(b), 0, ls);
+        Array.put(Board.knights(b), 1, ls);
+        Array.put(Board.bishops(b), 2, ls);
+        Array.put(Board.rooks(b), 3, ls);
+        Array.put(Board.queens(b), 4, ls);
+        Array.put(Board.kings(b), 5, ls);
+        Array.put(Board.whitePieces(b), 6, ls);
+        Array.put(Board.blackPieces(b), 7, ls);
+        Array.put(if (Board.turn(b)) 1i64 else 0i64, 8, ls);
+        Array.put(Integer.toUnsignedLong(Board.epSquare(b)), 9, ls);
+        Array.put(Board.castlingRights(b), 10, ls);
+        Array.put(Board.occupied(b), 11, ls);
+        Array.put(Integer.toUnsignedLong(Board.incrementalHash(b)), 12, ls);
+        Array.put(Integer.toUnsignedLong(DecodeResult.halfMoveClock(r)), 13, ls);
+        Array.put(unchecked_cast(DecodeResult.pgnMoves(r) as Object), 0, rs);
+        Array.put(unchecked_cast(DecodeResult.positionHashes(r) as Object), 1, rs);
+        Array.put(
+            match DecodeResult.lastUci(r) {
+                case None      => nullObject()
+                case Some(uci) => unchecked_cast(uci as Object)
+            }, 2, rs);
+        true
 }

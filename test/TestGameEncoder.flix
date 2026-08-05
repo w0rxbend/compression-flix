@@ -68,6 +68,17 @@ mod TestGameEncoder {
     def joinMoves(v: Vector[String]): String =
         String.intercalate(" ", Vector.toList(v))
 
+    ///
+    /// `GameEncoder.decode` from a `Vector` fixture.
+    ///
+    /// `decode` takes the caller's `Array[Int8, r]` and wraps it rather than copying
+    /// it, exactly as the original's `ByteBuffer.wrap` does, so the fixtures — which
+    /// are `Vector`s because `encode` returns one — are converted here, once, at the
+    /// boundary rather than inside the measured decoder.
+    ///
+    def decodeV(rc: Region[r], gt: GameTables, bytes: Vector[Int8], plies: Int32): DecodeResult[r] \ r =
+        GameEncoder.decode(rc, gt, Vector.toArray(rc, bytes), plies)
+
     /// `Encoder.encode`, failing loudly instead of returning `null`.
     def encodeOrFail(gt: GameTables, pgn: String): Vector[Int8] =
         match GameEncoder.encode(gt, movesOf(pgn)) {
@@ -92,9 +103,9 @@ mod TestGameEncoder {
     /// `enc|halfMoveClock|positionHashes|lastUci` for one game, from its bytes.
     def summarise(rc: Region[r], gt: GameTables, bytes: Vector[Int8], plies: Int32
                  ): (String, String) \ r =
-        let d = GameEncoder.decode(rc, gt, bytes, plies);
-        (joinMoves(DecodeResult.pgnMoves(d)),
-         "${DecodeResult.halfMoveClock(d)}|${hexOf(DecodeResult.positionHashes(d))}|"
+        let d = decodeV(rc, gt, bytes, plies);
+        (joinMoves(Array.toVector(DecodeResult.pgnMoves(d))),
+         "${DecodeResult.halfMoveClock(d)}|${hexOf(Array.toVector(DecodeResult.positionHashes(d)))}|"
              + "${uciStr(DecodeResult.lastUci(d))}")
 
     // --------------------------------------------------------- the 114 fixtures
@@ -155,9 +166,9 @@ mod TestGameEncoder {
             else {
                 let pgn = Vector.get(i, fs);
                 let plies = Vector.length(movesOf(pgn));
-                let d = GameEncoder.decode(rc, gt, encodeOrFail(gt, pgn), plies);
+                let d = decodeV(rc, gt, encodeOrFail(gt, pgn), plies);
                 Assert.assertEq(expected = "game ${i}: ${pgn}",
-                                "game ${i}: ${joinMoves(DecodeResult.pgnMoves(d))}");
+                                "game ${i}: ${joinMoves(Array.toVector(DecodeResult.pgnMoves(d)))}");
                 loop(i + 1)
             };
         loop(0)
@@ -171,8 +182,8 @@ mod TestGameEncoder {
     @Test
     pub def testLeastSurprise(): Unit \ Assert = region rc {
         let gt = GameTables.mk();
-        let d = GameEncoder.decode(rc, gt, Vector.repeat(22, 0i8), 22);
-        Assert.assertEq(expected = "e4 e5 Nf3 Nf6 Nxe5 Nxe4 Nxf7 Kxf7 d4 Nxf2 Kxf2 d5 Nc3 Nc6 Nxd5 Qxd5 Kg1 Nxd4 Qxd4 Qxd4+ Be3 Qxe3#", joinMoves(DecodeResult.pgnMoves(d)))
+        let d = decodeV(rc, gt, Vector.repeat(22, 0i8), 22);
+        Assert.assertEq(expected = "e4 e5 Nf3 Nf6 Nxe5 Nxe4 Nxf7 Kxf7 d4 Nxf2 Kxf2 d5 Nc3 Nc6 Nxd5 Qxd5 Kg1 Nxd4 Qxd4 Qxd4+ Be3 Qxe3#", joinMoves(Array.toVector(DecodeResult.pgnMoves(d))))
     }
 
     ///
@@ -187,11 +198,11 @@ mod TestGameEncoder {
         let bytes = encodeOrFail(gt, "d4 h5 c4 Rh6 Nf3 Rh8");
         Assert.assertEq(expected = "884d1bd0", hexOf(bytes));
 
-        let d0 = GameEncoder.decode(rc, gt, bytes, 0);
+        let d0 = decodeV(rc, gt, bytes, 0);
         Assert.assertEq(expected = Set#{0, 7, 56, 63},
             Bitboard.squareSet(Board.castlingRights(DecodeResult.board(d0))));
 
-        let d6 = GameEncoder.decode(rc, gt, bytes, 6);
+        let d6 = decodeV(rc, gt, bytes, 6);
         Assert.assertEq(expected = Set#{0, 7, 56},
             Bitboard.squareSet(Board.castlingRights(DecodeResult.board(d6))))
     }
@@ -209,7 +220,7 @@ mod TestGameEncoder {
         let plies = Vector.length(movesOf(pgn));
         let clocks =
             List.range(0, plies + 1)
-                |> List.map(i -> DecodeResult.halfMoveClock(GameEncoder.decode(rc, gt, bytes, i)));
+                |> List.map(i -> DecodeResult.halfMoveClock(decodeV(rc, gt, bytes, i)));
         Assert.assertEq(expected = 0 :: 0 :: 0 :: 1 :: 2 :: 3 :: 4 :: 5 :: 0 :: 1 :: 2 :: 0 :: 0 :: 0 :: 1 :: 2 :: 3 :: 0 :: 0 :: 1 :: 0 :: 1 :: 2 :: 0 :: 0 :: 1 :: 2 :: 3 :: 4 :: Nil, clocks)
     }
 
@@ -223,9 +234,9 @@ mod TestGameEncoder {
         let bytes = encodeOrFail(gt, pgn);
         Assert.assertEq(expected = "0250975aace2ce44ca00", hexOf(bytes));
         Assert.assertEq(expected = None,
-            DecodeResult.lastUci(GameEncoder.decode(rc, gt, bytes, 0)));
+            DecodeResult.lastUci(decodeV(rc, gt, bytes, 0)));
         Assert.assertEq(expected = Some("f6e6"),
-            DecodeResult.lastUci(GameEncoder.decode(rc, gt, bytes,
+            DecodeResult.lastUci(decodeV(rc, gt, bytes,
                 Vector.length(movesOf(pgn)))))
     }
 
@@ -243,7 +254,7 @@ mod TestGameEncoder {
         let hashes =
             List.range(0, 7)
                 |> List.map(i ->
-                    hexOf(DecodeResult.positionHashes(GameEncoder.decode(rc, gt, bytes, i))));
+                    hexOf(Array.toVector(DecodeResult.positionHashes(decodeV(rc, gt, bytes, i)))));
         Assert.assertEq(expected = "463b96" :: "823c9b" :: "0756b9" :: "662faf" :: "22a48b" :: "652a6022a48b" :: "00fdd3652a6022a48b" :: Nil, hashes)
     }
 
@@ -260,7 +271,7 @@ mod TestGameEncoder {
         let hashes =
             List.range(0, 8)
                 |> List.map(i ->
-                    hexOf(DecodeResult.positionHashes(GameEncoder.decode(rc, gt, bytes, i))));
+                    hexOf(Array.toVector(DecodeResult.positionHashes(decodeV(rc, gt, bytes, i)))));
         Assert.assertEq(expected = "463b96" :: "2df2e8" :: "4df682" :: "d1551e" :: "b0982f" :: "3c8123" :: "93d326" :: "5c3f9b93d326" :: Nil, hashes)
     }
 
@@ -346,10 +357,10 @@ mod TestGameEncoder {
     pub def testEmptyGame(): Unit \ Assert = region rc {
         let gt = GameTables.mk();
         Assert.assertEq(expected = Some(Vector#{}), GameEncoder.encode(gt, Vector#{}));
-        let d = GameEncoder.decode(rc, gt, Vector#{}, 0);
-        Assert.assertEq(expected = Vector#{}, DecodeResult.pgnMoves(d));
+        let d = decodeV(rc, gt, Vector#{}, 0);
+        Assert.assertEq(expected = Vector#{}, Array.toVector(DecodeResult.pgnMoves(d)));
         Assert.assertEq(expected = 0, DecodeResult.halfMoveClock(d));
-        Assert.assertEq(expected = "463b96", hexOf(DecodeResult.positionHashes(d)));
+        Assert.assertEq(expected = "463b96", hexOf(Array.toVector(DecodeResult.positionHashes(d))));
         Assert.assertEq(expected = None, DecodeResult.lastUci(d))
     }
 
@@ -368,10 +379,10 @@ mod TestGameEncoder {
             def loop(k) =
                 if (k > Vector.length(moves)) ()
                 else {
-                    let d = GameEncoder.decode(rc, gt, bytes, k);
+                    let d = decodeV(rc, gt, bytes, k);
                     Assert.assertEq(
                         expected = joinMoves(Vector.slice(start = 0, end = k, moves)),
-                        joinMoves(DecodeResult.pgnMoves(d)));
+                        joinMoves(Array.toVector(DecodeResult.pgnMoves(d))));
                     loop(k + 1)
                 };
             loop(0)

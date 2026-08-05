@@ -50,6 +50,46 @@ mod ClockEncoder {
     ///
     /// `centis` is *not* modified: the pipeline mutates a copy.
     ///
+    /// # Round 6: two independent attacks on this def, both measured, both reverted
+    ///
+    /// The clock-encode rows are the port's last losing timing rows and its last
+    /// losing allocation rows, and round 6 built and measured both of the changes the
+    /// research had ranked first for them. Neither moved a JMH row, and the reason is
+    /// the same in both cases, so it is recorded here rather than re-derived.
+    ///
+    /// **(a) Splitting the writer half into its own `writeAll` def.** Rationale:
+    /// `-Djdk.graal.TraceInlining=true` shows Graal compiling this def as its own root
+    /// and then refusing four callees — `BitOps.writeUnsigned` (bci 435),
+    /// `writeSignedAll`'s lifted loop (520), `LowBitTruncator.writeDigits` (604) and
+    /// `BitWriter.toArray` (684) — all at *later* bcis than the estimators, i.e. the
+    /// budget is spent before it reaches the writer, so the `BitWriter` struct escapes
+    /// four frames and partial escape analysis cannot scalarise it. Giving the writer
+    /// its own root gives it a fresh budget. A standalone probe measured 256 -> 208
+    /// and 344 -> 288 B/op. **JMH measured exactly zero**, on all six clock rows and on
+    /// both axes: 208/248/328 B/op before and after, 46.5/81.1/138.0 -> 46.5/81.1/138.5 ns.
+    ///
+    /// **(b) `@Inline` on `encode` and `decode`.** Rationale: `Api.Def$clockEncode`
+    /// refuses to inline this frame (787 bytecodes; `clockDecode` 867), and `@Inline`
+    /// is a *Flix*-level directive that deletes the call outright — `javap` confirms
+    /// the whole `ClockEncoder/` class directory disappears from a clean build and the
+    /// body reappears inside `Api/Def$clockEncode.staticApply`. A standalone
+    /// `ThreadMXBean.getCurrentThreadAllocatedBytes` probe over the real facade
+    /// confirms it removes a 48-byte `Value$`: Flix-minus-Scala goes 176 -> 128 B/op on
+    /// all three bands, identical to the byte across three runs. **JMH again measured
+    /// exactly zero** — 208/248/328 B/op both ways.
+    ///
+    /// The two disagree because they are measuring different compiled shapes, and the
+    /// JMH one is the shape the benchmark scores. In JMH's loop Graal already inlines
+    /// `Def$encode` into `Def$clockEncode` and scalarises the callee's box, so there is
+    /// nothing left for `@Inline` to delete. What remains is not the codec at all:
+    /// Scala's 136 B/op on the 8-reading band is exactly `int[8]` (48) + `int[10]` (56)
+    /// + `byte[11]` (32), the port allocates the same three arrays, and the flat
+    /// +72 B/op on every band is the `@Export` shim itself — a 24-byte
+    /// `Api/Def$clockEncode` closure that flows through the `Thunk$.invoke()` loop phi
+    /// where PEA cannot follow it, plus one 48-byte `Value$`. No annotation on this def
+    /// can reach either. See PORTING-NOTES, "Every `@Export`ed def costs 64 bytes a
+    /// call".
+    ///
     pub def encode(rc: Region[r], centis: Array[Int32, r1], startTime: Int32): Array[Int8, r] \ (r + r1) =
         let numMoves = Array.length(centis);
         if (numMoves == 0)
@@ -69,7 +109,14 @@ mod ClockEncoder {
             BitOps.writeSignedAll(encoded, writer);
             LowBitTruncator.writeDigits(centis, writer);
 
-            BitWriter.toArray(writer)
+            // `BitWriter.toArray` in tail position compiles to a heap continuation
+            // (see the note above `Board.put`), which also made the trampoline site
+            // inside `Api.clockEncode` bimorphic. The dead `_len` binding is what
+            // takes the call out of tail position: the single-let form `let r = f(x); r`
+            // does NOT, because a `let` of a tail call is still a tail call.
+            let out = BitWriter.toArray(writer);
+            let _len = Array.length(out);
+            out
         }
 
     ///

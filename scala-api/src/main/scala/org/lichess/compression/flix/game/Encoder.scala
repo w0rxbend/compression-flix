@@ -12,7 +12,12 @@ import org.lichess.compression.flix.Flix
   * process; see `org.lichess.compression.flix.Flix`. Unlike the original, which
   * kept a `ThreadLocal[MoveList]`, this is safe to call concurrently with no
   * per-thread state: the Flix implementation allocates its scratch move list
-  * inside a region, per call.
+  * inside a region, per call. That property is deliberate and it has a measured
+  * price — the per-call `long[256]` move buffer is about 2 KB of the ~5.5 KB a
+  * short-game `decode` allocates, and the original amortises it away through its
+  * `ThreadLocal`. Matching the original there would mean adopting its thread
+  * affinity, so it is a decision about this facade's contract rather than an
+  * optimisation, and it has not been taken.
   */
 object Encoder:
 
@@ -111,24 +116,44 @@ object Encoder:
   def decode(input: Array[Byte], plies: Int): DecodeResult =
     val codec  = Flix.codec
     val result = codec.gameDecode(Flix.tables, input, plies)
+
+    // One batched call rather than seventeen `codec.result*` ones. Each `@Export`ed
+    // Flix def allocates a `Def$` closure plus a 48-byte `dev.flix.runtime.Value$` to
+    // carry its result out through the `Thunk$` trampoline — 64 B a call, measured, and
+    // escape analysis cannot remove it because that trampoline is megamorphic. The
+    // seventeen therefore cost 1,040 B per decode, which was most of the gap on the
+    // allocation rows. `resultInto` is `boolean`-returning precisely so that it skips
+    // the box (`Value$.TRUE` is a static), and the two scratch arrays below are 160 B.
+    //
+    // They are allocated per call on purpose. Hoisting them into a `ThreadLocal` would
+    // save the 160 B and would break the "no per-thread state" property documented
+    // above; that is a contract decision, not an optimisation, and it has not been
+    // taken. The seventeen accessors remain on `FlixCodec` and are still the right way
+    // to read a single field.
+    val longs = new Array[Long](14)
+    val refs  = new Array[AnyRef](3)
+    codec.resultInto(result, longs, refs)
+
     DecodeResult(
-      pgnMoves = codec.resultPgnMoves(result),
+      pgnMoves = refs(0).asInstanceOf[Array[String]],
       board = Board(
-        pawns = codec.resultPawns(result),
-        knights = codec.resultKnights(result),
-        bishops = codec.resultBishops(result),
-        rooks = codec.resultRooks(result),
-        queens = codec.resultQueens(result),
-        kings = codec.resultKings(result),
-        white = codec.resultWhite(result),
-        black = codec.resultBlack(result),
-        turn = codec.resultTurn(result),
-        epSquare = codec.resultEpSquare(result),
-        castlingRights = codec.resultCastlingRights(result),
-        occupied = codec.resultOccupied(result),
-        incrementalHash = codec.resultIncrementalHash(result)
+        pawns = longs(0),
+        knights = longs(1),
+        bishops = longs(2),
+        rooks = longs(3),
+        queens = longs(4),
+        kings = longs(5),
+        white = longs(6),
+        black = longs(7),
+        turn = longs(8) != 0L,
+        epSquare = longs(9).toInt,
+        castlingRights = longs(10),
+        occupied = longs(11),
+        // Zero-extended on the way out, so the narrowing cast is what restores the top
+        // bit. Reading it as a `Long` would be wrong for every hash with bit 31 set.
+        incrementalHash = longs(12).toInt
       ),
-      halfMoveClock = codec.resultHalfMoveClock(result),
-      positionHashes = codec.resultPositionHashes(result),
-      lastUci = codec.resultLastUci(result)
+      halfMoveClock = longs(13).toInt,
+      positionHashes = refs(1).asInstanceOf[Array[Byte]],
+      lastUci = refs(2).asInstanceOf[String]
     )

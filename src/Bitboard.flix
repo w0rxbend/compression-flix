@@ -494,32 +494,41 @@ mod Bitboard {
     /// board edge, where "edge" means a step of Chebyshev distance greater than 2.
     ///
     /// The Scala original nests two local recursive functions, `attackLoop` over
-    /// the deltas and `@tailrec deltaLoop` walking one delta; they call each other,
-    /// so both are lifted to top-level helpers here.
+    /// the deltas and `@tailrec deltaLoop` walking one delta. They call each other,
+    /// and MUTUAL recursion is the one shape Flix cannot compile to a `goto`: each
+    /// step allocated a heap continuation dispatched through the megamorphic
+    /// `Thunk$.invoke()`. Table construction makes ~121 000 `slidingAttacks` calls
+    /// (107 648 magic subsets plus the between/rays pairs), so that was roughly a
+    /// million allocations and a million megamorphic dispatches, all executed
+    /// interpreted during cold start. Fusing the two loops into ONE self-recursive
+    /// def — carrying both `deltaIndex` and `sq`, and restarting at `square`
+    /// exactly where `attackLoop` did — makes it a `goto`.
     ///
+    /// This is a cold-start change with no steady-state exposure: `slidingAttacks`
+    /// is called only from `Tables.mk` (the four leaper tables, the magic subsets
+    /// and the between/rays builders) and from `test/TestBitboard.flix`, never on
+    /// the encode, decode or perft path.
+    ///
+    @Inline
     pub def slidingAttacks(square: Int32, occupied: Int64, deltas: Vector[Int32]): Int64 =
-        attackLoop(square, occupied, deltas, 0, 0i64)
+        slidingLoop(square, occupied, deltas, 0, square, 0i64)
 
-    /// `attackLoop` of the Scala `slidingAttacks`.
-    def attackLoop(square: Int32, occupied: Int64, deltas: Vector[Int32],
-                   deltaIndex: Int32, acc: Int64): Int64 =
+    /// The Scala `attackLoop` and `deltaLoop` fused; see `slidingAttacks` above.
+    def slidingLoop(square: Int32, occupied: Int64, deltas: Vector[Int32],
+                    deltaIndex: Int32, sq: Int32, acc: Int64): Int64 =
         if (deltaIndex >= Vector.length(deltas)) acc
-        else deltaLoop(square, occupied, deltas, deltaIndex, square, acc)
-
-    /// `deltaLoop` of the Scala `slidingAttacks`.
-    def deltaLoop(square: Int32, occupied: Int64, deltas: Vector[Int32],
-                  deltaIndex: Int32, sq: Int32, tempAcc: Int64): Int64 = {
-        let newSq = sq + Vector.get(deltaIndex, deltas);
-        if (newSq < 0 or newSq >= 64 or Square.distance(newSq, sq) > 2)
-            attackLoop(square, occupied, deltas, deltaIndex + 1, tempAcc)
         else {
-            let newAcc = Bits.borL(tempAcc, Bits.bit(newSq));
-            if (contains(occupied, newSq))
-                attackLoop(square, occupied, deltas, deltaIndex + 1, newAcc)
-            else
-                deltaLoop(square, occupied, deltas, deltaIndex, newSq, newAcc)
+            let newSq = sq + Vector.get(deltaIndex, deltas);
+            if (newSq < 0 or newSq >= 64 or Square.distance(newSq, sq) > 2)
+                slidingLoop(square, occupied, deltas, deltaIndex + 1, square, acc)
+            else {
+                let newAcc = Bits.borL(acc, Bits.bit(newSq));
+                if (contains(occupied, newSq))
+                    slidingLoop(square, occupied, deltas, deltaIndex + 1, square, newAcc)
+                else
+                    slidingLoop(square, occupied, deltas, deltaIndex, newSq, newAcc)
+            }
         }
-    }
 
     // Every wrapper from here to `aligned` is `@Inline`, as a family, and the
     // annotation is load-bearing rather than decorative.

@@ -1331,7 +1331,16 @@ apart in one JVM under one JIT and one blackhole mode.
   a cost rather than dressed up as a trade-off. What the port buys is elsewhere —
   no `ThreadLocal`, no shared mutable state, and a compiler that enforces both.
 
-### 5.8 The optimisation campaign — what was applied, what it bought, what was reverted
+### 5.8 The first optimisation campaign — what was applied, what it bought, what was reverted
+
+> **This section describes the state at the end of the FIRST campaign, and its
+> figures are superseded.** It is kept because the mechanisms and the reverted
+> experiments in it are still the reference record. For where the port actually
+> ended up, see §5.9 and the **FINAL VERIFICATION** section of
+> `benchmarks/results.md` — in short, the three rows §5.8 calls losses on game
+> decode and all three clock decode rows have since flipped, cold start went
+> 76.2 ms -> 37.7 ms, and the remaining losers are clock encode and two game
+> decode allocation rows.
 
 **This section used to list three optimisations as "measured and deliberately not
 applied". They have now been applied, along with a dozen more.** The numbers below
@@ -1354,11 +1363,12 @@ from the repository.
 | game decode allocation | 78.9-94.9x | 2.30-3.11x |
 | cold start | 172.3 ms vs 69.1 ms | 76.2 ms vs 68.6 ms |
 
-**The target was to beat the Scala original. Game encode and move generation beat
-it; game decode and both clock directions do not.** Nine of the twelve throughput
-rows are still on the slow side of parity; the three that are not are game encode.
-Full tables, caveats and the machine-did-not-move control are in
-`benchmarks/results.md`.
+**The target was to beat the Scala original. At the end of THIS campaign, game
+encode and move generation beat it; game decode and both clock directions did
+not.** Nine of the twelve throughput rows were still on the slow side of parity;
+the three that were not were game encode. Full tables, caveats and the
+machine-did-not-move control are in `benchmarks/results.md`. (Rounds 4-6, §5.9,
+took that to ten of twelve winning — see the final verification.)
 
 Every change was gated on `sbt difftest/test` — **emitted bytes**, not node counts —
 and on `flix test`. Both were re-run after every individual change and again at the
@@ -1473,16 +1483,95 @@ Huffman symbol written to the stream — provably unchanged. It was gated on
 `difftest`, never on perft, exactly as this section said it must be, and it passed
 on the first attempt.
 
-#### What is still open
+#### What was still open at the end of §5.8 — all four items superseded
 
-- **Game decode, 1.02-1.11x.** `GameEncoder.san` runs once per decoded ply and is
-  the largest remaining thing on that path. Decode allocation is 2.3-3.1x.
-- **Both clock directions, 1.15-1.35x — and the measurement is not trustworthy.**
-  At 36-183 ns/op a fixed per-invocation cost is a meaningful share of the ratio.
-  Three rounds have now said this and none has fixed it. Re-measure with `-bm ss`
-  or a 100x coarser workload *before* optimising further.
-- **`Move.mk` is ~960 bytecodes** and `@Inline` on it pushes its callers over the
-  JIT's budget. Deleting `MoveCtx` and threading its five members would shrink it.
+Every bullet this section used to carry has since been acted on. They are kept, with
+their outcomes, because two of the four were *wrong* and the record of that is worth
+more than the prediction was.
+
+- **Game decode, 1.02-1.11x** — closed by rounds 4 and 5. Short and median now win at
+  0.875x / 0.911x; the long band is 1.031x. `GameEncoder.san` was indeed the largest
+  item and round 4's reusable char buffer is what took decode under parity for the
+  first time. Decode allocation went 2.30-3.11x -> 1.535 / 1.058 / 0.813x.
+- **"Both clock directions, 1.15-1.35x — and the measurement is not trustworthy"** —
+  **this was wrong, and it had the sign backwards.** Round 4 built
+  `FlixClockHarnessBench` and measured JMH's own per-op loop overhead on this machine
+  at 0.336-0.340 ns/op, i.e. 0.9% of the smallest clock score, and the batched rows
+  reproduced the raw ratios to within 0.01x — in the direction that makes the gap
+  *bigger*. `-bm ss` was rejected on purpose: at 36 ns/op it times one un-warmed
+  invocation between two `System.nanoTime()` calls, so the instrument exceeds the
+  quantity. The clock gap was always real. Round 5 then flipped all three clock decode
+  rows to 0.78-0.82x.
+- **"`Move.mk` is ~960 bytecodes … deleting `MoveCtx` would shrink it"** — applied in
+  round 4. `MoveCtx` is gone and its five members travel as leading scalars, worth
+  48 B/ply off decode, encode and every perft node.
+- **The remaining loser is clock encode**, at 1.177-1.288x, and it is the one place
+  where five separate measured attempts have failed. See `benchmarks/results.md`,
+  round 5, for the full autopsy and for the one untried lever (`BitWriter.toArray`
+  writes its output a byte at a time because Flix has no primitive narrowing
+  operation).
+
+### 5.9 Rounds 4, 5 and 6 — see `benchmarks/results.md`
+
+The campaign continued for three more rounds after §5.8, against the rows that were
+still behind. All are documented in full in `benchmarks/results.md` — every row,
+every reverted change with the measurement that killed it, and the reason each
+surviving loser survives. The state at the end of round 6, all gated on `flix test`
+(122/0/4), `sbt difftest/test` (25 examples, 0 failures) and the move-order-sensitive
+depth-4 perft checksum `8459721354967636746`:
+
+| axis | end of §5.8 | end of round 5 | end of round 6 | **independently verified** |
+|---|---:|---:|---:|---:|
+| game encode, three bands | 0.82-0.88x | 0.768 / 0.845 / 0.906x | 0.772 / 0.830 / 0.895x | **0.774 / 0.827 / 0.915x** |
+| game encode allocation | 0.34-0.47x | 0.317 / 0.286 / 0.212x | 0.296 / 0.164 / 0.228x | **0.296 / 0.164 / 0.228x** |
+| game decode | 1.02-1.11x | 0.875 / 0.911x, long 1.031x | 0.754 / 0.815 / 0.956x | **0.796 / 0.858 / 0.953x** |
+| game decode allocation | 2.30-3.11x | 1.535 / 1.058 / 0.813x | 1.518 / 1.046 / 0.811x | 1.518 / 1.045 / **0.810x** |
+| clock decode | 1.15-1.31x | 0.803 / 0.782 / 0.817x | 0.790 / 0.764 / 0.770x | **0.775 / 0.786 / 0.768x** |
+| clock decode allocation | 1.45-3.33x | 0.937 / 0.950x, long 1.111x | 0.937 / 0.950 / 0.963x | **0.937 / 0.950 / 0.963x** |
+| clock encode | 1.27-1.35x | 1.288 / 1.273 / 1.177x | 1.259 / 1.281 / 1.166x | 1.260 / 1.269 / 1.168x |
+| clock encode allocation | 1.28-1.53x | a flat +72 B/op | a flat +72 B/op | a flat +72 B/op |
+| cold start | 76.2 ms vs 68.6 ms | 37.0 ms vs 67.7 ms | 36.5 ms vs 67.9 ms | **37.7 ms vs 67.9 ms (0.555x)** |
+| perft depth-4 | 79 s vs 160.5 s | 78 s vs 160.5 s | 79 s vs 160.5 s | **80 s vs 161.3 s (2.02x)** |
+
+The last column is `benchmarks/run-optimised-2/`, taken in a separate verification
+pass that re-ran every gate from a clean build and re-took the whole sweep rather
+than trusting the rounds. It reproduces them. Two rows read differently from round
+6 and both are the *denominator* moving, not the port: game decode short was
+published at 0.754x from a run whose Scala control had drifted, and 0.796x is the
+figure that survives six forks; game encode long went 0.895x -> 0.915x while Flix's
+absolute time was unchanged at 586 µs. The verification section of
+`benchmarks/results.md` gives the per-fork data for both.
+
+**Sixteen of the twenty-four rows beat the original. Eight do not, so the stated
+goal — every row under 1.000x — was not met.** The eight are, however, no longer
+open work. Six of them are clock encode, whose entire remaining gap is the
+`@Export` boundary — the port allocates exactly the three arrays the original does and
+a flat +72 B/op of `Def$` closure and `Value$` on top, and round 6 measured two
+independent attempts on it at zero. The other two are game decode allocation on the
+short and median bands, which only a `ThreadLocal` move buffer can win; that is a
+change to the facade's documented "no per-thread state" contract, and rounds 5, 6 and
+the verification pass all escalated it rather than take it inside a performance patch.
+**It remains the one open decision, and it needs an owner of the artifact's contract
+rather than another benchmark.**
+
+Where the goal *was* met is worth stating as precisely as where it was not: ten of
+the twelve throughput rows now beat the reference (against three after §5.8 and none
+at the start), both game-codec directions win on all three bands, cold start is
+0.555x, and depth-4 move generation runs 2.02x faster with a bit-identical checksum.
+
+The mechanisms those rounds turned up that are not specific to this codebase are in
+`flix/PORTING-NOTES.md`: `@Inline` deletes a value-returning def's 48-byte `Value$` but
+a `Unit`-returning twin has none to delete; a `java.*` static is a bare `invokestatic`
+where a Flix call carries ~50-85 bytecodes of trampoline; every `@Export` costs 64 B a
+call unless it returns `Bool`; `unsafe IO { … }` makes an expression pure, so a Java
+call kept for its side effect is silently deleted; `Array.repeat` is a trampolined call
+where `Array.empty` is seven bytecodes, but the substitution is site-dependent and must
+be measured per site; a hand-written `ThreadMXBean` probe and a JMH allocation row can
+disagree, and the JMH row is the one that counts; a `Bool` return allocates nothing, so
+widening a hot `Unit` def to hand back a value the caller was recomputing is free; a
+decoder's contract is its symbols, so its *algorithm* is not pinned the way an
+encoder's is; and an `@Inline`d body upstream of a closure-allocating call is part of
+that call's inlining budget, so shrinking it can still cost allocation.
 ---
 
 ## 6. Summary

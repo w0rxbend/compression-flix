@@ -117,13 +117,13 @@ mod GameTables {
 /// `lastUci: String | null` is `Option[String]`.
 ///
 pub enum DecodeResult[r: Region] {
-    case DecodeResult(Vector[String], Board[r], Int32, Vector[Int8], Option[String])
+    case DecodeResult(Array[String, r], Board[r], Int32, Array[Int8, r], Option[String])
 }
 
 mod DecodeResult {
 
     /// Scala `result.pgnMoves`.
-    pub def pgnMoves(d: DecodeResult[r]): Vector[String] =
+    pub def pgnMoves(d: DecodeResult[r]): Array[String, r] =
         let DecodeResult.DecodeResult(m, _, _, _, _) = d;
         m
 
@@ -138,7 +138,7 @@ mod DecodeResult {
         c
 
     /// Scala `result.positionHashes`.
-    pub def positionHashes(d: DecodeResult[r]): Vector[Int8] =
+    pub def positionHashes(d: DecodeResult[r]): Array[Int8, r] =
         let DecodeResult.DecodeResult(_, _, _, h, _) = d;
         h
 
@@ -151,6 +151,7 @@ mod DecodeResult {
 mod GameEncoder {
 
     import java.lang.Character
+    import java.lang.{String => JString}
 
     // ------------------------------------------------------------------ encode
 
@@ -193,7 +194,7 @@ mod GameEncoder {
         match parseMove(gt, board, pgnMove) {
             case None => false
             case Some((role, promotion, fromMask, toSq)) =>
-                Board.legalMoves(board, legals);
+                discard Board.legalMoves(board, legals);
                 // The parsed promotion is turned into a code once, so the predicate
                 // compares two `Int32`s instead of building an `Option[Role]` per
                 // candidate move. Same test: the encoding of `Option[Role]` as
@@ -450,23 +451,34 @@ mod GameEncoder {
     /// A corrupt bit stream makes `MoveList.selectRank` fail its range check, which
     /// is `bug!` here and `require`'s `IllegalArgumentException` in the original.
     ///
-    pub def decode(rc: Region[r], gt: GameTables, input: Vector[Int8], plies: Int32
+    pub def decode(rc: Region[r], gt: GameTables, input: Array[Int8, r], plies: Int32
                   ): DecodeResult[r] \ r = {
-        let rd     = BitReader.mk(rc, Vector.toArray(rc, input));
+        let rd     = BitReader.mk(rc, input);
+        // Round 6 tried `Array.empty` here — which is what the original's
+        // `Array.ofDim[String](plies)` actually is, since that fills with `null`, not
+        // `""` — and MEASURED IT WORSE: game decode allocation 53,753 -> 54,340
+        // (short) and 69,046 -> 69,760 (median) B/op, with the `sanBuf` site below
+        // converted at the same time. Reverted. `Array.repeat` is not free everywhere
+        // (see `BitOps.readSignedArray`, where dropping it won a row), but it is not
+        // uniformly costly either, and these two sites are on the wrong side.
         let output = Array.repeat(rc, plies, "");
         let board  = Board.initial(rc, GameTables.tables(gt), GameTables.psqt(gt), GameTables.zobrist(gt));
         let legals = MoveList.mkDefault(rc);
-        let positionHashes = Array.repeat(rc, 3 * (plies + 1), 0i8);
+        // `Array.empty`, not `Array.repeat(..., 0i8)`: `setHash` writes all
+        // `3 * (plies + 1)` bytes and `Reflect.default()` for `Int8` is the same zero.
+        let positionHashes = Array.empty(rc, 3 * (plies + 1));
+        // One scratch buffer for every SAN token: the longest is "Qa1xb2=Q" at 8.
+        let sanBuf = Array.repeat(rc, 16, ' ');
         setHash(positionHashes, -1, Board.zobristHash(board));
 
         let (lastZeroingPly, lastIrreversiblePly, lastUci) =
-            decodeLoop(rc, gt, rd, board, legals, output, positionHashes, plies, 0, -1, -1, None);
+            decodeLoop(rc, gt, rd, board, legals, output, positionHashes, sanBuf, plies, 0, -1, -1, None);
 
         DecodeResult.DecodeResult(
-            Array.toVector(output),
+            output,
             board,
             plies - 1 - lastZeroingPly,
-            Vector.slice(start = 0, end = 3 * (plies - lastIrreversiblePly), Array.toVector(positionHashes)),
+            sliceBytes(rc, positionHashes, 3 * (plies - lastIrreversiblePly)),
             lastUci)
     }
 
@@ -477,33 +489,43 @@ mod GameEncoder {
     /// Returns `(lastZeroingPly, lastIrreversiblePly, lastUci)`.
     ///
     def decodeLoop(rc: Region[r], gt: GameTables, rd: BitReader[r], board: Board[r], legals: MoveList[r],
-                   output: Array[String, r], positionHashes: Array[Int8, r], plies: Int32,
+                   output: Array[String, r], positionHashes: Array[Int8, r], sanBuf: Array[Char, r], plies: Int32,
                    i: Int32, lastZeroingPly: Int32, lastIrreversiblePly: Int32,
                    lastUci: Option[String]): (Int32, Int32, Option[String]) \ r =
         if (i > plies)
             (lastZeroingPly, lastIrreversiblePly, lastUci)
         else {
             // `0 < i || i < plies` is false only for the degenerate `plies == 0`.
-            if (0 < i or i < plies) Board.legalMoves(board, legals) else ();
+            //
+            // `legalMoves` hands back `checkers != 0`, which is exactly what the
+            // original's `isCheck()` recomputes here — `attacksTo(king, !turn)` on a
+            // board `legalMoves` did not mutate. Using it deletes one `attacksTo` per
+            // ply (12.0% of decode's magic-bitboard lookups) plus a trampolined
+            // `Def$isCheck` and `Def$attacksToOcc` call. The value is only consulted
+            // when `0 < i`, and `0 < i` implies the guard below is true, so it is
+            // always the flag from the `legalMoves` call for *this* position; the
+            // `false` fallback belongs to the degenerate `plies == 0` path, where
+            // `0 < i` is false and short-circuits before reading it.
+            let inCheck = if (0 < i or i < plies) Board.legalMoves(board, legals) else false;
 
-            if (0 < i and Board.isCheck(board)) {
+            if (0 < i and inCheck) {
                 let suffix = if (MoveList.isEmpty(legals)) "#" else "+";
-                Array.put("${Array.get(i - 1, output)}${suffix}", i - 1, output)
+                Array.put(String.concat(Array.get(i - 1, output), suffix), i - 1, output)
             } else ();
 
             if (i < plies) {
                 let rank = Huffman.read(GameTables.huffman(gt), rd);
                 let move = MoveList.selectRank(legals, rank);
-                Array.put(san(rc, gt, move, legals), i, output);
+                Array.put(san(gt, move, legals, sanBuf), i, output);
                 Board.play(board, move);
                 let nextZeroing = if (Move.isZeroing(move)) i else lastZeroingPly;
                 let nextIrreversible = if (Move.isIrreversible(move)) i else lastIrreversiblePly;
                 setHash(positionHashes, i, Board.zobristHash(board));
                 let nextUci = if (i + 1 == plies) Some(Move.uci(move)) else lastUci;
-                decodeLoop(rc, gt, rd, board, legals, output, positionHashes, plies,
+                decodeLoop(rc, gt, rd, board, legals, output, positionHashes, sanBuf, plies,
                            i + 1, nextZeroing, nextIrreversible, nextUci)
             } else
-                decodeLoop(rc, gt, rd, board, legals, output, positionHashes, plies,
+                decodeLoop(rc, gt, rd, board, legals, output, positionHashes, sanBuf, plies,
                            i + 1, lastZeroingPly, lastIrreversiblePly, lastUci)
         }
 
@@ -524,64 +546,95 @@ mod GameEncoder {
     /// same file forces the rank digit, and any other competitor forces the file
     /// letter.
     ///
-    /// # Why a `StringBuilder` and not interpolation
+    /// # Why a scratch `char` buffer and neither interpolation nor a `StringBuilder`
     ///
-    /// Flix compiles `"${a}${b}"` to a chain of `java.lang.String.concat`, and a
-    /// `Char` inside an interpolation to `Character.toString`. The interpolated
-    /// version of this function emitted thirteen `concat` sites and five
-    /// `Character.toString` sites, each allocating a `String` **and** a fresh
-    /// `byte[]` — and it built the final six-part result out of already-concatenated
-    /// intermediates, so a disambiguated non-pawn move cost roughly 480 bytes where
-    /// the Scala original's single `StringBuilder` costs 80-100.
+    /// Interpolation was tried first and is the worst of the three: Flix compiles
+    /// `"${a}${b}"` to a chain of `java.lang.String.concat` and a `Char` inside one
+    /// to `Character.toString`, which for this function meant thirteen `concat` sites
+    /// and five `Character.toString` sites, each allocating a `String` **and** a
+    /// fresh `byte[]`, and it built the six-part result out of already-concatenated
+    /// intermediates — roughly 480 bytes for a disambiguated non-pawn move.
     ///
-    /// This produces the identical characters; `difftest` compares the decoded SAN
-    /// token array against the Scala original over the whole corpus.
+    /// A `StringBuilder` replaced it and was much better, but Flix's `StringBuilder`
+    /// is `enum StringBuilder[_: Region](JStringBuilder)`, so each token still cost a
+    /// `Tag$Obj` wrapper, a `java.lang.StringBuilder`, its default 16-char `byte[]`,
+    /// the result `String` and *its* `byte[]` — about 126 B/ply, against the Scala
+    /// original's `StringBuilder(6)` route at about 101 B/ply.
     ///
-    /// `StringBuilder.appendCodePoint` takes an `Int32` and appends it directly.
-    /// `StringBuilder.append` would go through `ToString`, which allocates a
-    /// one-character `String` per call — exactly what this is removing.
-    def san(rc: Region[r], gt: GameTables, move: Move, legals: MoveList[r]): String \ r =
+    /// This form writes the characters into ONE buffer allocated per `decode` call
+    /// (not per ply) and materialises the token with a single `String.valueOf`, so a
+    /// token costs a `String` and one `byte[]`. The buffer is 16 chars; the longest
+    /// token this function can write is 8 (`Qa1xb2=Q`) and the check suffix is
+    /// appended afterwards by `String.concat`, so there is no overflow path.
+    ///
+    /// The characters, their order and the branches that select them are transcribed
+    /// unchanged from the `StringBuilder` version; `difftest` compares the decoded
+    /// SAN token array against the Scala original over the whole corpus.
+    ///
+    def san(gt: GameTables, move: Move, legals: MoveList[r], buf: Array[Char, r]): String \ r =
         if (Move.moveType(move) == Move.castling())
             if (Move.fromSq(move) < Move.toSq(move)) "O-O" else "O-O-O"
         else if (Move.moveType(move) == Move.normal() or Move.moveType(move) == Move.enPassant()) {
             let t = GameTables.tables(gt);
             let fromSq = Move.fromSq(move);
             let toSq = Move.toSq(move);
-            let sb = StringBuilder.empty(rc);
 
-            StringBuilder.appendString(Role.symbol(Move.role(move)), sb);
+            let isPawn = Move.roleIndex(move) == Role.index(Role.Pawn);
+            let n0 = if (not isPawn) { putChar(buf, 0, roleChar(Move.role(move))); 1 } else 0;
 
-            if (Move.roleIndex(move) != Role.index(Role.Pawn)) {
-                let others = othersLoop(move, legals, 0, 0i64);
-                if (others != 0i64) {
-                    // The Scala block above, with the two flags named rather than
-                    // carried in a tuple: `rank` is exactly "a competitor shares
-                    // the file", and `file` is "a competitor shares the rank, or
-                    // there is a competitor that shares neither".
-                    let sameRank = Bits.bandL(others, Bitboard.ranks(t, Square.rank(fromSq))) != 0i64;
-                    let sameFile = Bits.bandL(others, Bitboard.files(t, Square.file(fromSq))) != 0i64;
-                    let file = if (sameFile) sameRank else true;
-                    if (file) StringBuilder.appendCodePoint(fileCode(fromSq), sb) else ();
-                    if (sameFile) StringBuilder.appendCodePoint(rankCode(fromSq), sb) else ()
-                } else ()
-            } else if (Move.capture(move))
-                StringBuilder.appendCodePoint(fileCode(fromSq), sb)
-            else
-                ();
+            let n1 =
+                if (not isPawn) {
+                    let others = othersLoop(move, legals, 0, 0i64);
+                    if (others != 0i64) {
+                        let sameRank = Bits.bandL(others, Bitboard.ranks(t, Square.rank(fromSq))) != 0i64;
+                        let sameFile = Bits.bandL(others, Bitboard.files(t, Square.file(fromSq))) != 0i64;
+                        let file = if (sameFile) sameRank else true;
+                        let na = if (file) { putChar(buf, n0, fileChar(fromSq)); n0 + 1 } else n0;
+                        if (sameFile) { putChar(buf, na, rankChar(fromSq)); na + 1 } else na
+                    } else n0
+                } else if (Move.capture(move)) { putChar(buf, n0, fileChar(fromSq)); n0 + 1 }
+                else n0;
 
-            if (Move.capture(move)) StringBuilder.appendString("x", sb) else ();
-            StringBuilder.appendCodePoint(fileCode(toSq), sb);
-            StringBuilder.appendCodePoint(rankCode(toSq), sb);
+            let n2 = if (Move.capture(move)) { putChar(buf, n1, 'x'); n1 + 1 } else n1;   // 'x'
+            putChar(buf, n2, fileChar(toSq));
+            putChar(buf, n2 + 1, rankChar(toSq));
+            let n3 = n2 + 2;
 
             let promotionCode = Move.promotionCode(move);
-            if (promotionCode != 0) {
-                StringBuilder.appendString("=", sb);
-                StringBuilder.appendString(Role.symbol(Role.ofIndex(promotionCode - 1)), sb)
-            } else ();
-
-            StringBuilder.toString(sb)
+            let n4 =
+                if (promotionCode != 0) {
+                    putChar(buf, n3, '=');
+                    putChar(buf, n3 + 1, roleChar(Role.ofIndex(promotionCode - 1)));
+                    n3 + 2
+                } else n3;
+            mkString(buf, n4)
         } else
             "--"
+
+    /// `buf(i) = (char) cp`. `Character.toChars`-free: every code point written here
+    /// is ASCII.
+    @Inline
+    def putChar(buf: Array[Char, r], i: Int32, c: Char): Unit \ r =
+        Array.put(c, i, buf)
+
+    /// `(char) ('a' + Square.file(sq))`, without an Int32 -> Char conversion:
+    /// Flix has none, and `String.charAt` is on the compiler's pure whitelist.
+    @Inline
+    def fileChar(sq: Int32): Char = String.charAt(Square.file(sq), "abcdefgh")
+
+    @Inline
+    def rankChar(sq: Int32): Char = String.charAt(Square.rank(sq), "12345678")
+
+    /// The role's SAN letter. Never called for a pawn, whose symbol is empty.
+    @Inline
+    def roleChar(r: Role): Char = String.charAt(0, Role.symbol(r))
+
+    /// `new java.lang.String(buf, 0, n)` — one `String` and one `byte[]`, against the
+    /// `StringBuilder` wrapper enum + `java.lang.StringBuilder` + its `byte[]` +
+    /// the `String` + its `byte[]` that the builder form allocated.
+    @Inline
+    def mkString(buf: Array[Char, r], n: Int32): String \ r =
+        unsafe IO as r { JString.valueOf(buf, 0, n) }
 
     ///
     /// The Scala loop that collects the other moves of the same role to the same
@@ -616,21 +669,18 @@ mod GameEncoder {
     def hasPrefix(s: String, p: String): Bool = s.startsWith(p)
 
     ///
-    /// `Square.file(sq) + 'a'`, as a code point for `StringBuilder.appendCodePoint`.
+    /// `buffer.slice(0, n)` on a byte array: exactly ONE copy, which is what Scala's
+    /// `positionHashes.slice` costs. This replaced
+    /// `Vector.slice(0, n, Array.toVector(buffer))`, which copied twice, and whose
+    /// result `Api.resultPositionHashes` then copied a third time.
     ///
-    /// `Character.hashCode(c)` rather than `Char.toBmpCodePoint(c)`: the latter is
-    /// `Short.valueOf(x).intValue()` masked with `0xFFFF`, a boxed conversion,
-    /// while `Character.hashCode` is specified as `(int) c` and is a pure
-    /// `java.lang` static. Checked equal on all 65536 char values.
-    ///
-    @Inline
-    def fileCode(sq: Int32): Int32 =
-        Square.file(sq) + Character.hashCode('a')
-
-    /// `Square.rank(sq) + '1'`, as a code point.
-    @Inline
-    def rankCode(sq: Int32): Int32 =
-        Square.rank(sq) + Character.hashCode('1')
+    def sliceBytes(rc: Region[r], buffer: Array[Int8, r], n: Int32): Array[Int8, r] \ r =
+        let out = Array.empty(rc, n);
+        def loop(i) = {
+            if (i < n) { Array.put(Array.get(i, buffer), i, out); loop(i + 1) } else ()
+        };
+        loop(0);
+        out
 
     ///
     /// Scala `private def setHash(buffer: Array[Byte], ply: Int, hash: Int): Unit`.
@@ -660,6 +710,10 @@ mod TestGameEncoderSelf {
     /// The "position hash 1. e4 d5 2. e5 f5 3. Ke2 Kf7" fixture: the exact byte
     /// stream, the half-move clock and the three-deep position-hash stack.
     ///
+    /// `decode` takes and returns region arrays rather than `Vector`s (it wraps the
+    /// caller's bytes the way `ByteBuffer.wrap` does, and hands back the `String[]`
+    /// the original hands back), so the fixtures are converted at the boundary.
+    ///
     @Test
     pub def testEncodeKnownGame(): Unit \ Assert = {
         let gt = GameTables.mk();
@@ -669,12 +723,12 @@ mod TestGameEncoderSelf {
             case Some(bytes) => {
                 Assert.assertEq(expected = Vector#{31i8, -54i8, -53i8, 61i8}, bytes);
                 region rc {
-                    let d = GameEncoder.decode(rc, gt, bytes, 6);
-                    Assert.assertEq(expected = moves, DecodeResult.pgnMoves(d));
+                    let d = GameEncoder.decode(rc, gt, Vector.toArray(rc, bytes), 6);
+                    Assert.assertEq(expected = moves, Array.toVector(DecodeResult.pgnMoves(d)));
                     Assert.assertEq(expected = 2, DecodeResult.halfMoveClock(d));
                     Assert.assertEq(
                         expected = Vector#{0i8, -3i8, -45i8, 101i8, 42i8, 96i8, 34i8, -92i8, -117i8},
-                        DecodeResult.positionHashes(d));
+                        Array.toVector(DecodeResult.positionHashes(d)));
                     Assert.assertEq(expected = Some("e8f7"), DecodeResult.lastUci(d))
                 }
             }
@@ -687,8 +741,9 @@ mod TestGameEncoderSelf {
     @Test
     pub def testInitialPositionHash(): Unit \ Assert = region rc {
         let gt = GameTables.mk();
-        let d = GameEncoder.decode(rc, gt, Vector#{}, 0);
-        Assert.assertEq(expected = Vector#{70i8, 59i8, -106i8}, DecodeResult.positionHashes(d));
+        let d = GameEncoder.decode(rc, gt, Array.empty(rc, 0), 0);
+        Assert.assertEq(expected = Vector#{70i8, 59i8, -106i8},
+                        Array.toVector(DecodeResult.positionHashes(d)));
         Assert.assertEq(expected = None, DecodeResult.lastUci(d))
     }
 
@@ -698,11 +753,11 @@ mod TestGameEncoderSelf {
     @Test
     pub def testLeastSurprise(): Unit \ Assert = region rc {
         let gt = GameTables.mk();
-        let d = GameEncoder.decode(rc, gt, Vector.repeat(22, 0i8), 22);
+        let d = GameEncoder.decode(rc, gt, Array.repeat(rc, 22, 0i8), 22);
         Assert.assertEq(
             expected = "e4 e5 Nf3 Nf6 Nxe5 Nxe4 Nxf7 Kxf7 d4 Nxf2 Kxf2 d5 Nc3 Nc6 Nxd5 Qxd5 "
                      + "Kg1 Nxd4 Qxd4 Qxd4+ Be3 Qxe3#",
-            String.intercalate(" ", Vector.toList(DecodeResult.pgnMoves(d))))
+            String.intercalate(" ", Array.toList(DecodeResult.pgnMoves(d))))
     }
 
     ///

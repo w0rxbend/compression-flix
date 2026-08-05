@@ -159,4 +159,27 @@ public interface FlixCodec {
 
     /** {@code DecodeResult.board.incrementalHash} — the full Polyglot Zobrist hash. */
     int resultIncrementalHash(java.lang.Object result);
+
+    /**
+     * All seventeen accessors above in one call, into caller-supplied arrays.
+     *
+     * <p>Each {@code @Export}ed Flix def allocates a {@code Def$} closure for its
+     * arguments and a 48-byte {@code dev.flix.runtime.Value$} to carry its result out
+     * through the {@code Thunk$} trampoline — 64 bytes a call, and the facade makes
+     * seventeen calls per decode. A {@code boolean}-returning export is the one shape
+     * that skips the box, because {@code Value$.TRUE} is a static, so this replaces
+     * 1,040 B/decode with 64 B plus two reusable arrays.
+     *
+     * <p>{@code longs} must have length at least 14 and {@code refs} at least 3.
+     * Contents on return, in order: the eight bitboards
+     * (pawns, knights, bishops, rooks, queens, kings, white, black), {@code turn} as
+     * 1/0, {@code epSquare}, {@code castlingRights}, {@code occupied},
+     * {@code incrementalHash}, {@code halfMoveClock}; then {@code pgnMoves},
+     * {@code positionHashes}, {@code lastUci}. The three {@code int} fields are
+     * zero-extended, so a caller must narrow them back with {@code (int)} — a
+     * sign-extending read of {@code incrementalHash} would lose its top bit.
+     *
+     * <p>Always returns {@code true}.
+     */
+    boolean resultInto(java.lang.Object result, long[] longs, java.lang.Object[] refs);
 }

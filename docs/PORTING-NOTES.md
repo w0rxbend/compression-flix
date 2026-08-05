@@ -837,16 +837,55 @@ threshold and no way to disable the `Thunk$`/`Suspension$` trampoline.
 That is not as limiting as it sounds: applying them to this port turned a codec
 that was 5x slower than its Scala original into one that is faster.
 
+### Two forks is not enough for the REFERENCE side, and the failure flatters you
+
+A Flix-versus-reference benchmark publishes a ratio, so the reference is the
+denominator of every number you report — and it is the side nobody watches, because
+it is not the code being changed.
+
+On the final verification run of this port, `FlixGameBench.scalaDecode` (short band)
+came in at 231.758 ± **70.786** µs against a previous run's 186.793. The per-fork raw
+data says exactly what happened:
+
+```
+scalaDecode short   fork 0 [187.7, 187.1, 187.5, 187.1, 187.4]
+                    fork 1 [278.7, 277.8, 274.7, 275.2, 274.4]
+```
+
+Fork 0 reproduces; fork 1 picked up a compilation plan ~48% slower and held it, flat,
+for all five iterations. The Flix rows in the same JVM were tight. At `-f 2` that one
+fork moves the *published* ratio from 0.796x to **0.647x** — a 0.15x improvement that
+does not exist, in the direction that makes the port look good. At `-f 6` it averages
+out and the control drifts by 1.4%.
+
+Three rules follow. **Check the reference side's drift against the previous run before
+believing any ratio**, and treat a material move as invalidating the comparison rather
+than as background noise. **Read `rawData` per fork, not just the score and error bar**
+— a bimodal fork pair produces a large `scoreError` that looks like ordinary variance
+and is not. And **raise `-f` until the control reproduces**: for this suite that is
+`-f 6` on the game benchmarks, where `-f 2` suffices for the clock ones. Allocation is
+the opposite case and is worth knowing as a contrast: `gc.alloc.rate.norm` on the
+reference side reproduced **to the byte** across three separate runs on this machine,
+which makes it the most sensitive available check that the fixtures and the JVM really
+are the same.
+
 ## Making Flix fast — mechanisms verified in bytecode
 
 Everything in this part was established by compiling a probe and reading `javap`
-output, and every claim was then applied to this port and measured with JMH. The
-campaign it comes from took the game codec from **5.1-5.4x slower than the Scala
-original to 0.82-0.88x on encode** and the depth-4 perft sweep from 494 s to 79 s
-against Scala's 160.5 s, without changing an emitted byte. See `REWRITE.md` §5.8.
+output, and every claim was then applied to this port and measured with JMH.
 
-Read this before optimising anything. Four of the six items below are invisible in
-the source and none of them is in the language documentation.
+The campaign it comes from took a port that was **uniformly 2.7-5.4x slower than
+the Scala original** to one that beats it on **ten of the twelve throughput rows**
+— game encode 0.774/0.827/0.915x, game decode 0.796/0.858/0.953x, clock decode
+0.775/0.786/0.768x — with cold start at 0.555x and the depth-4 perft sweep at 80 s
+against Scala's 161.3 s, all without changing an emitted byte. The two throughput
+rows it does **not** win are clock encode (1.17-1.27x), and that row plus the clock
+encode allocation rows are a property of Flix's `@Export` boundary rather than open
+work; see "Every `@Export`ed def costs 64 bytes a call". Final verified figures are
+in `benchmarks/results.md`; `REWRITE.md` §5.8-5.9 is the narrative.
+
+Read this before optimising anything. Most of the items below are invisible in the
+source and none of them is in the language documentation.
 
 ### `java.lang` statics on the boxed primitives are PURE — this is the escape hatch
 
@@ -937,22 +976,92 @@ notTailCall  ->  iload_0; aload_1; checkcast [I
                  invokestatic Tail/Def$sink.staticApply     <- direct call, no allocation
 ```
 
-Two ways to take a call out of tail position:
+Three ways to take a call out of tail position:
 
 * a trailing `; ()` on a `Unit`-returning def — the identity on a `Unit` expression;
 * `@Inline` on a def whose body is a single delegation, so the *caller* issues the
-  `invokestatic` and the thunk never exists.
+  `invokestatic` and the thunk never exists;
+* for a **non-`Unit`** return, where `; ()` does not typecheck, bind the result and
+  then bind something derived from it before returning it:
+
+  ```flix
+  let out  = BitWriter.toArray(writer);
+  let _len = Array.length(out);   // dead, but it is what moves the call
+  out
+  ```
+
+  Verified in `ClockEncoder.encode`: with the two lets the method ends
+  `new Value$ / putfield o / areturn`, without them it ends
+  `new BitWriter/Def$toArray$NNNNNN / areturn`.
 
 `let r = f(x); r` does **not** work — a `let` of a tail call is still a tail call.
+The second binding is what makes the difference, which is exactly why it looks like
+dead code and must be commented.
 
 **Do this only to bounded delegations** (a wrapper calling a loop, one extra JVM
 frame). Never to a self- or mutually recursive loop: the thunk is what makes those
 stack-safe. Self-recursive tail calls are unaffected anyway — Flix compiles those
 to `goto`.
 
+### MUTUAL recursion is the shape that cannot be fixed by annotation — fuse it
+
+The rule above has a corollary that is worth its own heading, because it is worth
+**45 ms of this port's cold start** and it is invisible in the source.
+
+*Self* tail recursion compiles to `goto`. A tail call to a *different* def compiles
+to a heap continuation. Two functions that tail-call **each other** are therefore in
+the worst case: every alternation allocates, and neither `@Inline` (silently ignored
+on recursion, and unsound here anyway) nor the `; ()` idiom (which would break
+stack-safety) can help. The only fix is to *fuse the two loops into one
+self-recursive def* carrying the union of their loop variables.
+
+This port's `Bitboard.slidingAttacks` was the textbook case — the Scala original
+nests `attackLoop` over the deltas and `deltaLoop` walking one delta, and they call
+each other:
+
+```
+Bitboard/Def$attackLoop  ->  new Bitboard/Def$deltaLoop     (before every areturn)
+Bitboard/Def$deltaLoop   ->  new Bitboard/Def$attackLoop    (on both exit paths)
+```
+
+At ~9 alternations per call and ~121 000 calls during table construction that is
+roughly a million allocations and a million megamorphic `Thunk$.invoke()` dispatches,
+all executed *interpreted* because they happen before the JIT has warmed. Fusing them
+into one `slidingLoop(square, occupied, deltas, deltaIndex, sq, acc)` — restarting at
+`square` exactly where `attackLoop` did — compiles to a `goto` loop with **zero**
+`new` instructions, and took cold start from 76.2 ms to 37.0 ms against Scala's
+unchanged 68.7 ms.
+
+When you transcribe a Scala pair of mutually recursive inner loops, fuse them at
+transcription time. The visiting order is preserved by carrying both indices.
+
 A trailing `()` looks exactly like dead code and an eager cleanup will delete it.
 Comment every site. This port documents the rule once, above `Board.put`, and
 points at it from the other five files.
+
+### An effect-polymorphic function parameter costs a closure only in tail position
+
+A parameter of type `(Int32, Int32) -> Unit \ ef` is usually free: Flix
+defunctionalises the call site and emits a direct call. It stops being free where the
+call is in **tail** position, because there the compiler must materialise the lambda
+as a resumable continuation — a `Clo` class extending `Clo2$…` and implementing
+`Frame$`, with a `pc` field and a `copy()` method. Invoking that costs, per call, the
+closure, the copy `getUniqueThreadClosure()` makes of it, and a `Def$` thunk that its
+`applyFrame` allocates and returns, plus two `Thunk$.invoke()` dispatches.
+
+`LowBitTruncator` had exactly this shape on both sides. The write side's final
+`writeBits(...)` was in tail position, so it paid all of the above for one 3-bit
+write; inlining the callback away and calling `BitWriter.writeBits` directly was
+worth **clock encode 1.364/1.319/1.262x -> 1.294/1.257/1.198x**.
+
+The read side's `readBits` calls were *not* in tail position, so Flix was already
+defunctionalising them and there was nothing to win. Making it direct anyway — the
+symmetric, obviously-tidier change — **lost**: clock decode 1.148/1.174/1.286x ->
+1.233/1.298/1.214x, +5.5 ns on a 64 ns operation. It was reverted and the callback is
+still there with a comment saying why.
+
+So: look for the pattern, but only where the callback call is in tail position, and
+measure the other sites rather than assuming symmetry.
 
 ### A single-case `enum` destructure materialises every field
 
@@ -996,12 +1105,210 @@ one-field `Psqt` enum became `type alias Psqt = Vector[Int32]`.
   `Bitboard.files` was inlined. If you want a family inlined, annotate the whole
   family rather than the members that happen to need it.
 
-One JIT-level consequence, because Flix's inliner feeds HotSpot's: a def that lands
-just under HotSpot's `FreqInlineSize` (325 bytecodes) gets inlined *and* has its
-`Value$` box scalarised away; one just over it gets neither. Several changes in this
-port paid entirely because they pushed a hot def across that line. Measure — a
-change that looks obviously right from bytecode size alone can still lose (splitting
-`readBits`/`writeBits` here was a 10% regression).
+#### The JIT you are tuning against is Graal, not C2 — earlier rounds got this wrong
+
+Three of this port's four reverted optimisations were argued from HotSpot's
+`FreqInlineSize` of 325 bytecodes. **That flag is never consulted on the benchmark
+JVM.** Verified on this machine:
+
+```
+$ java -XX:+PrintFlagsFinal -version | grep -E 'UseJVMCICompiler|FreqInlineSize|MaxInlineSize'
+     bool UseJVMCICompiler   = true  {JVMCI product} {default}
+     intx FreqInlineSize     = 325   {C2 pd product}
+     intx MaxInlineSize      = 35    {C2 product}
+```
+
+`benchmarks/results.md` has always recorded that the harness runs with the inherited
+`-XX:+EnableJVMCIProduct`, so the top tier is Graal and the C2 flags govern nothing
+the benchmarks measure. The figures actually in force, from
+`java -XX:+JVMCIPrintProperties -version`:
+
+| property | value |
+|---|---|
+| `jdk.graal.MaximumInliningSize` | 300 |
+| `jdk.graal.TrivialInliningSize` | 10 |
+| `jdk.graal.MaximumRecursiveInlining` | 5 |
+| `jdk.graal.PartialEscapeAnalysis` | true |
+| `jdk.graal.MaximumEscapeAnalysisArrayLength` | 128 |
+
+Two consequences. The budget to aim at is **300**, not 325. And the diagnostic is
+`-Djdk.graal.TraceInlining=true`, which prints a per-callsite decision tree with
+reasons; `-XX:+PrintInlining` reports C1/C2 decisions and says nothing at all about
+the tier-4 compilations that matter here.
+
+The correction has teeth. `BitWriter.writeBits` sat at 407 bytecodes for three
+rounds, of which **83 were `Thunk$`/`Suspension$`/`UnhandledEffectError$` boilerplate
+from one call to another Flix def** (`IntArrayList.copyOf`). Round 5 replaced that
+callee with `java.util.Arrays.copyOf` — a `java.*` static compiles to a bare
+`invokestatic` and carries none of that — and bound `l->index` once instead of five
+times, which took `writeBits` to **274 bytecodes as a leaf**, under Graal's budget
+for the first time. Measured: clock encode 46.7/82.0/142.3 -> 46.3/80.9/138.9 ns,
+i.e. 1.300/1.288/1.200x -> 1.276/1.254/1.183x. Small, but it is the first thing in
+five attempts at that def to move at all.
+
+**Crossing the budget is necessary for the JIT to inline, not sufficient for the
+change to pay, and it is worth being blunt about this because the bytecode argument
+is seductive.** Round 4 removed `@Inline` from `IntArrayList.add`, which took
+`writeBits` from 407 to 235 — comfortably inlinable, exactly as predicted, and it
+LOST: clock encode 1.319/1.255/1.194x -> 1.255/1.393/1.337x, a small win on the
+8-reading band and a large loss on the 16- and 30-reading ones, where the buffer
+grows and the now-real call to `add` is paid once per 32 bits written. Reverted.
+
+#### `@Inline` deletes a call, and with it the 48-byte `Value$` — but only a *value*-returning def has one to delete
+
+This is the sharpest single lever found in the whole campaign, and its **sign depends
+on the return type**, which is not obvious from the source.
+
+Every value-returning Flix def ends `new dev/flix/runtime/Value$ … putfield i32 …
+areturn`, and `Value$` is a universal box with `b/c/i8/i16/i32/i64/f32/f64/o` fields —
+34 bytes of fields plus a 12-byte header, **48 bytes**, allocated per call unless the
+JIT inlines *and* scalarises it. A `Unit`-returning def instead returns the free
+`Value$.UNIT` static, and a `Bool`-returning one returns `Value$.TRUE`/`FALSE`, also
+statics. Each call site additionally emits ~50 bytecodes of trampoline: an
+`instanceof Thunk$` loop, a `Suspension$` test, a provably dead
+`UnhandledEffectError$`/`ReifiedSourceLocation$` block, then `checkcast Value$` and a
+`getfield`.
+
+`@Inline` on such a def removes the call *at the Flix level* — no `Def$` class is even
+emitted — so the trampoline and the box both disappear, and **none of that depends on
+a JIT threshold going your way**. That is what makes it different in kind from
+splitting a def to fit an inlining budget.
+
+Applied to `BitReader.readBits` (`Int32`-returning, 17/33/66 calls per clock decode,
+and hundreds per game decode) it was worth, in one change:
+
+| row | before | after |
+|---|---|---|
+| clock decode short | 58.96 ns (1.072x) | 44.12 ns (**0.793x**) |
+| clock decode median | 104.73 ns (1.048x) | 73.12 ns (**0.781x**) |
+| clock decode long | 222.54 ns (1.248x) | 150.30 ns (**0.814x**) |
+| clock decode alloc | 200 / 232 / 720 B/op | 120 / 152 / 240 B/op |
+
+The same annotation on `BitWriter.writeBits` — same module, same shape, same call
+counts, the obviously symmetric change — **lost**, and lost in both of the two forms
+it was built in:
+
+| variant | clock encode (ns) |
+|---|---|
+| baseline | 46.34 / 82.02 / 141.86 |
+| `@Inline`, flush arm outlined, `writeUnsigned`'s two sites unified | 47.25 / 86.83 / 149.22 |
+| `@Inline`, both arms in the body, unified sites, `add` growth via `Arrays.copyOf` so the pasted body is a call-free leaf | 47.39 / 85.80 / 150.16 |
+
+The two variants agree, which rules out the outlined-flush call as the cause and
+leaves the annotation itself. **The difference is the box.** `readBits` returns
+`Int32`, so inlining it deletes a 48-byte allocation per call; `writeBits` returns
+`Unit`, so there was never a box to win, only an `invokestatic`, and pasting a
+400-bytecode body into every write site costs more than that is worth.
+
+So the rule is: `@Inline` a hot **value**-returning def to delete its `Value$`. Do not
+assume the `Unit`-returning twin behaves the same way — here it went the other way,
+by 5%.
+
+A corollary for the straddle/rare arm: outline it *and* make it self-tail-recursive
+with an accumulator, so Flix compiles it to `goto` rather than paying a call and a box
+per level. `readBits`' straddle arm recursed inside
+`Bits.bor(Bits.shl(res, needed), readBits(needed, rd))` — not tail position — which is
+where the clock decode long band's +504 B/op allocation cliff came from.
+
+### A `java.*` static is a bare `invokestatic`; a call to another Flix def is not
+
+Worth its own heading because it is the escape hatch that finally shrank
+`BitWriter.writeBits`, and because it is invisible in the source: the two look
+identical.
+
+A call to another Flix def emits, **at the call site**, `invokestatic …staticApply`
+returning a `Result$`, then `dup / instanceof Thunk$ / invokeinterface
+Thunk$.invoke() / goto`, then an `instanceof Suspension$` test, then a provably dead
+`new UnhandledEffectError$ / new ReifiedSourceLocation$ / athrow` block, then
+`checkcast Value$` and a `getfield`. In `writeBits` that boilerplate was 83 of 407
+bytecodes — 20% of the method — for one call to `IntArrayList.copyOf`.
+
+A call to a `java.*` static carries none of it:
+
+```flix
+l->data = unchecked_cast(Arrays.copyOf(l->data, newLen) as Array[Int32, r] \ r)
+```
+
+compiles to `invokestatic java/util/Arrays.copyOf:([II)[I` and nothing else. This is
+why round 4's "outline just the growth branch into a `grow` def" only got `writeBits`
+from 407 to 351 — the outlined call brought the same boilerplate to the new site —
+and why replacing the callee with the JDK's own method got it to 274.
+
+Three hand-rolled loops in this port were replaceable this way and one still is:
+`IntArrayList`'s growth (done — and `Arrays.copyOf` is literally what the Scala
+original calls), `IntArrayList.toArray`, and `GameEncoder.sliceBytes`. Note that
+`Array.copy` already lowers to `java.util.Arrays.copyOfRange`, so it is fine as is,
+whereas `Array.repeat(rc, n, zero)` is `newarray` **plus** a redundant
+`java.util.Arrays.fill` of a region the JVM has already zeroed.
+
+### `unsafe IO { … }` makes the expression PURE, so an unused Java call is deleted
+
+A silent-wrong-answer trap, found the hard way, and the reason this port still
+assembles its output bytes by hand instead of through `java.nio.ByteBuffer`.
+
+`ByteBuffer.putInt` is not one of the `java.lang` statics Flix treats as pure, so it
+needs an `unsafe IO { … }` block. That block *removes* the effect — that is its whole
+purpose — and what is left is a pure expression whose result nobody reads. Flix
+deletes it.
+
+```flix
+let bb = unsafe IO { ByteBuffer.wrap(out) };
+let _bb = unsafe IO { bb.putInt(v) };     // silently discarded
+```
+
+`flix check` is clean, `flix build-jar` succeeds, and the writes simply do not happen:
+42 of this port's 122 tests failed with every whole-word byte zero and only the
+hand-written ragged tail present. (Binding the result is not enough; and *not* binding
+it is a hard error, `Redundancy Error [E8956] Useless expression`, which is at least
+loud.)
+
+So: `unsafe IO` is for a Java call whose **value** you use. For a Java call you want
+for its **side effect**, you need a genuinely `\ IO` seam, not an `unsafe` block — or
+you keep doing it in Flix. Anything that consumes the result only to defeat the
+dead-code eliminator is one refactor away from firing again, in a codec where the
+failure mode is wrong bytes rather than an exception.
+
+### Every `@Export`ed def costs 64 bytes a call — unless it returns `Bool`
+
+`Api.resultKnights(result)` looks like a field read. It compiles to: `new
+Api/Def$resultKnights`, `dup`, `<init>`, `putfield arg0`, an `instanceof Thunk$` /
+`invokeinterface Thunk$.invoke()` trampoline loop, a `Suspension$` test, `checkcast
+Value$`, `getfield i64`, `lreturn`. Measured over a 200 000-call loop on one fixed
+handle — the case most favourable to escape analysis, and escape analysis still fails
+because `Thunk$.invoke()` is megamorphic across the thousands of `Thunk$`
+implementations in the jar — that is a 16-byte `Def$` closure plus a 48-byte `Value$`,
+**64 bytes per accessor call**.
+
+`Bool` is the exception, and it is the whole fix: `Value$.TRUE` and `Value$.FALSE` are
+public static finals, so a `Bool`-returning export skips the box and costs 16 bytes.
+(`Unit` would be tidier and is not available: it is not an exportable return type,
+Entry Point Error E1396.)
+
+The Scala facade here read a decoded game through seventeen such accessors — 1,040
+bytes per `decode`, against a decode that legitimately allocates about 58 bytes per
+ply. Replacing them, for the facade only, with **one** `Bool`-returning export that
+fills a caller-supplied `long[14]` and `Object[3]` moved game decode allocation
+1.848/1.225/0.898x -> 1.527/1.058/0.813x, on every band, for no change in time. The
+seventeen stay: they are documented API and they are the readable way to read one
+field.
+
+The boundary is also the **whole** of the clock codec's allocation gap, and that is
+worth stating as a closed result rather than an open target. On the 8-reading band the
+Scala original allocates 136 B/op, which is exactly `int[8]` (48) + `int[10]` (56) +
+`byte[11]` (32) — its `Writer`, its `IntArrayList` and its `HeapByteBuffer` are all
+scalarised. The Flix port allocates those same three arrays and nothing else. The flat
+**+72 B/op on every band** is the 24-byte `Api/Def$` closure plus one 48-byte `Value$`,
+and the `Def$` in particular cannot be removed: it flows through the `Thunk$.invoke()`
+trampoline loop phi, where partial escape analysis cannot follow it. `@Inline` on the
+codec does not reach it (see the `ThreadMXBean` section above), and a `Bool`-returning
+`clockEncodeInto` makes it worse — 32 B for the `Fn3` `Def$` plus a caller-allocated
+24-byte `Object[1]` against the 24 B that would be left. Record such a row as a property
+of the mechanism, not as work outstanding.
+
+If an export must hand back an `Int32` that will be widened, use
+`Integer.toUnsignedLong` and narrow with a cast on the far side. The sign-extending
+widening is indistinguishable for a square index or a ply count and silently wrong for
+a Zobrist hash, whose top bit is live.
 
 ### Named-argument standard-library functions allocate a record per call
 
@@ -1018,6 +1325,23 @@ signed value, so that branch survives into machine code. Inside a magic-bitboard
 lookup the operand is a hash, so it mispredicts about half the time.
 
 Audit for other named-argument stdlib calls on hot paths while you are there.
+
+That branchless `ushr` is still **five operations where Java's `>>>` is one**, so it
+is worth knowing when an arithmetic `shr` is provably equivalent and can replace it:
+
+* when the operand is **non-negative** — `>>` and `>>>` agree at every distance;
+* when the result is immediately **masked to `k` low bits and `k + distance <= 32`**
+  — the two shifts differ only in bits `32 - distance` upwards, which the mask
+  discards. This is the case in `BitReader.readBits`' fast arm, where after the
+  update `distance + numReqBits == numRemainingBits <= 32` by construction.
+
+The second one is worth 3-9% of clock decode here and about 1% of game decode
+(checked over 1.58 million (x, distance, width) combinations before it was applied).
+The *first* one is available in `BitWriter.writeBits` on the same reasoning and was
+measured there too — and it **lost**, moving clock encode median from 81.2 to 88.1 ns
+while the other two bands did not move. Both are recorded at their sites. The lesson
+is the one above: on this codebase a strictly-cheaper instruction sequence can still
+lose by moving an inlining decision, so measure per site rather than sweeping.
 
 ### String interpolation is a chain of `String.concat`
 
@@ -1038,6 +1362,116 @@ measuring bytecode sizes. (See "`flix/build/` accumulates stale classes".)
 Note also that `unzip -l jar | tail -1` reports the **uncompressed** total, not the
 file size — 3.3 MB uncompressed for this port's 1.87 MB jar. Do not read a jar-size
 regression into it.
+
+### `Array.repeat` is a trampolined call, `Array.empty` is seven bytecodes — but the substitution is site-dependent
+
+`Array.repeat(rc, n, zero)` emits, at the **call site**, `invokestatic
+Array/Def$repeat$NNN.staticApply` plus the ~55-bytecode `Thunk$` / `Suspension$` /
+`UnhandledEffectError$` / `ReifiedSourceLocation$` trampoline, a `checkcast Value$` and
+a `getfield`; the callee is `newarray` + `java.util.Arrays.fill` + a 48-byte `Value$`.
+`Array.empty(rc, n)` inlines to seven bytecodes — `iconst_0; iload; newarray; dup_x1;
+swap; invokestatic Arrays.fill` — with no call, no trampoline and no box. For any
+element type whose `Reflect.default()` is the value `repeat` was filling with
+(`Int8`/`Int32`/`Int64`/`Char` -> zero) the two are interchangeable wherever every slot
+is written before it is read, or where unwritten slots are provably never read.
+
+It is worth real rows. `BitOps.readSignedArray` alone took clock decode allocation on
+the 30-reading band from 240 to 208 B/op against Scala's 216 — **flipping the row** —
+and the same substitution in `BitWriter.toArray` and `IntArrayList.mk` took game encode
+median allocation from 61,833 to 35,481 B/op.
+
+**It is not a sweep.** The same change at `GameEncoder.decode`'s `output` and `sanBuf`,
+where it is equally safe (`Array.ofDim[String](plies)` in the Scala original is
+null-filled, and `sanBuf` is only ever read back over `[0, n)`), measured *worse*: game
+decode allocation 53,753 -> 54,340 (short) and 69,046 -> 69,760 (median) B/op. Convert
+one site at a time and measure it. And note the separate, independently verified result
+that the redundant `Arrays.fill` itself costs nothing — Graal eliminates it (`new
+int[10]` 4.004 ns vs `new int[10]` + `Arrays.fill(x,0)` 3.988 ns over 200 M ops). What
+you are removing is the call and the box, not the fill.
+
+### A `ThreadMXBean` probe and a JMH allocation row can disagree — and the JMH row is the one that counts
+
+Two independent researchers measured `@Inline` on `ClockEncoder.encode` removing a
+48-byte `Value$`, deterministically, 3/3 runs. It was reproduced a third time here with
+`com.sun.management.ThreadMXBean.getCurrentThreadAllocatedBytes` over the *real* Scala
+facade, at 200 000 calls a band: Flix-minus-Scala goes 176 -> 128 B/op on all three
+bands, identical to the byte. The annotation demonstrably does what it says — a clean
+`rm -rf build artifact && flix build-jar` emits **no `ClockEncoder/` class directory at
+all**, and the body reappears inside `Api/Def$clockEncode.staticApply`.
+
+JMH's `gc.alloc.rate.norm` for the same operation moved by **exactly zero**: 208/248/328
+B/op before and after. The same thing happened to a structurally different change aimed
+at the same object (splitting the writer half of `encode` into its own def), which a
+standalone probe put at -48/-56/0 B/op and JMH put at 0/0/0.
+
+Both instruments are correct and they are measuring different compiled shapes. A probe
+loop and a JMH `@Benchmark` loop give Graal different inlining budgets and different
+profile pollution, so an object that survives in one is scalarised in the other. Draw
+two rules from it: **profile the shape you are scored on**, and **a deterministic
+allocation delta in a hand-written probe is a hypothesis about the benchmark, not a
+result for it**. Verify against `-prof gc` before believing a row will move.
+
+### A `Bool` return costs nothing — use it to hand back a value the caller was recomputing
+
+A `Bool`-returning Flix def ends `getstatic dev/flix/runtime/Value$.TRUE` / `getstatic
+dev/flix/runtime/Value$.FALSE` / `areturn`. Those are public static finals, so it
+allocates nothing — exactly like the `Unit` return's `Value$.UNIT`, and unlike every
+other return type, which builds a 48-byte `Value$`. Widening a hot `Unit`-returning def
+to `Bool` is therefore free at every call site, including the ones that `discard` it.
+
+`Board.legalMoves` is the case that matters here. It computes
+`checkers = attacksTo(king, !turn)` and threw it away; `GameEncoder.decodeLoop` then
+called `isCheck()`, which recomputes that same expression on a board `legalMoves` did
+not mutate — 1.00 redundant call per ply, 17.8-23.4% of all `attacksTo` calls and 12.0%
+of every magic-bitboard lookup a decoded ply performs. Returning the flag deleted it
+along with a trampolined `Def$isCheck` and a trampolined `Def$attacksToOcc` per ply, and
+moved game decode from 356.6/728.3 to 348.2/697.2 µs on the median and long bands.
+
+This change had been proposed once before and declined on the grounds that a non-`Unit`
+`legalMoves` would box on every call. It does not. If you are about to reject a change
+because of what a Flix return type is assumed to cost, `javap` it first.
+
+### A decoder's contract is its symbols, so its algorithm is not pinned — an encoder's is
+
+Worth stating explicitly in a byte-fidelity port, because it is the one place where a
+genuinely different algorithm is admissible. The encoder writes the bytes, so every
+tie-break, every push order and every comparison in it is load-bearing. The decoder only
+has to produce the same *symbols*; how it gets there is free.
+
+`MoveList.selectRank` is the example. The original quickselects with a Lomuto partition,
+which resolves ties by position, so for a long time it looked pinned. But `Move.score`
+packs five bit-disjoint fields, which makes scores **injective within one legal move
+list** — checked at 0 duplicates over 206 604 lists / 5 072 212 moves in an exhaustive
+depth-4 walk — so the `(rank+1)`-th largest is unique and *any* correct selection
+returns the same `Move`. That unpinned a hybrid: one pass keeping the best four in four
+scalars for `targetRank < 4` (about half of all plies), quickselect above it. Game decode
+went 169.6/385.9/753.6 -> 151.7/356.6/728.3 µs with allocation unchanged.
+
+Two things make the argument safe rather than plausible, and both are worth reproducing
+for any similar change: the permutation the old algorithm left behind had to be shown
+unobservable (here the only post-selection reads are an order-independent OR-reduction
+and a size test, and the next ply clears the list), and the def had to have no caller on
+the encode side (`selectRank` has exactly one caller in the repository, in `decodeLoop`).
+The depth-4 perft checksum is the gate that catches a mistake in either.
+
+### An `@Inline`d body upstream of a closure is not free to change size
+
+`Board.sliderBlockers` is `@Inline`d into `Board.legalMoves`, whose tail is
+`MoveList.retain(moves, m -> isSafe(b, king, m, blockers))` — a closure over three
+values. Replacing two magic-table lookups inside `sliderBlockers` with two 64-entry
+table reads is strictly less work, is provably the same value (asserted exhaustively
+over all 64 squares against both the magic path and the generator), and left the
+move-order-sensitive depth-4 perft checksum bit-identical. It still had to be reverted:
+on the long game-encode band that closure stopped being scalarised, and allocation went
+104,241 -> 140,581 B/op with encode time 581.9 -> 601.2 µs.
+
+Nothing about the change was wrong. What was wrong was measuring only the axis it
+targeted. **An `@Inline`d def that sits upstream of a closure-allocating call is part of
+that call's inlining budget**, so any edit to it — including one that makes it smaller —
+can flip a scalarisation decision. Measure `gc.alloc.rate.norm` as well as time, and
+measure it with `-f 3`: this particular row is **bimodal within one build**, its
+per-iteration values clustering at 96 490 and ~137 000 B/op, so a single fork cannot be
+read as a point estimate.
 
 ### Standard-library primitives that are much slower than their Java namesakes
 

@@ -19,7 +19,7 @@ mod TestBoardPerft {
     def perft(b: Board[r], depth: Int32): Int64 \ r =
         if (depth >= 1) region rc {
             let moves = MoveList.mkDefault(rc);
-            Board.legalMoves(b, moves);
+            discard Board.legalMoves(b, moves);
             if (depth == 1) Int32.toInt64(MoveList.getSize(moves))
             else childLoop(b, moves, depth, 0, 0i64)
         } else 1i64
@@ -153,7 +153,7 @@ mod TestBoardPerft {
         if (depth <= 0) here
         else region rc {
             let moves = MoveList.mkDefault(rc);
-            Board.legalMoves(b, moves);
+            discard Board.legalMoves(b, moves);
             here + hashChildren(b, moves, depth, 0, 0)
         }
     }

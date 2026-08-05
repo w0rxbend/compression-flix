@@ -532,6 +532,36 @@ mod Board {
     /// Scala's `&` binds tighter than `|`, so the snipers expression groups as
     /// `(rookAttacks & (rooks ^ queens)) | (bishopAttacks & (bishops ^ queens))`.
     ///
+    /// # Round 6: the two empty-board lookups were tabulated and REVERTED
+    ///
+    /// `rookAttacks(t, king, 0)` and `bishopAttacks(t, king, 0)` depend only on
+    /// `king`, and instrumented over the corpus they are 2 of the 16.6 magic-table
+    /// lookups a decoded ply performs — two dependent loads scattered across a 710 KB
+    /// array for a value a 512-byte table could answer out of L1. Round 6 built that:
+    /// two 64-entry `Vector[Int64]` fields on `Tables`, filled from the same
+    /// `slidingAttacks(sq, 0, deltas)` that `updateAttacks` writes into the magic
+    /// slot the `occupied == 0` lookup reads, plus `TestBitboard.testEmptySliderTables`
+    /// asserting agreement on all 64 squares against BOTH the magic path and the
+    /// generator. It was correct: 123 tests green, `difftest` green, and the full
+    /// move-order-sensitive depth-4 perft sweep returned checksum
+    /// `8459721354967636746`, bit-identical.
+    ///
+    /// It was reverted because it cost more than it bought. `sliderBlockers` is
+    /// `@Inline`d into `legalMoves`, whose tail is
+    /// `MoveList.retain(moves, m -> isSafe(b, king, m, blockers))` — a closure over
+    /// three values. Changing this body changes `legalMoves`' size, and on the long
+    /// game-encode band that closure stopped being scalarised: allocation went
+    /// 104,241 -> 140,581 B/op (mean of 3 forks, per-iteration values shifting from a
+    /// {96 490, ~137 000} pair to a {~137 000, 147 322} pair) and encode long time went
+    /// 581.9 -> 601.2 us. Its own benefit was never separable from the `Array.empty`
+    /// change measured alongside it and was inside the noise of every band.
+    ///
+    /// The lesson generalises past this site: an `@Inline`d body that sits upstream of
+    /// a closure-allocating call is not free to grow or shrink, and the allocation row
+    /// is where that shows up first. Anyone retrying this should measure
+    /// `gc.alloc.rate.norm` on game encode long with `-f 3` FIRST — a single fork
+    /// cannot see it, because the row is bimodal within one build.
+    ///
     @Inline
     def sliderBlockers(b: Board[r], king: Int32): Int64 \ r = {
         let t = b->tables;
@@ -614,23 +644,48 @@ mod Board {
     /// if blockers != 0 || this.epSquare != 0 then moves.retain(isSafe(king, _, blockers))
     /// ```
     ///
-    /// The `MoveCtx` (the five things `Move.set` reads off the board) is built once
-    /// here: nothing in generation mutates the board, so it is constant throughout.
+    /// The five things `Move.set` reads off the board are constant throughout —
+    /// nothing in generation mutates it — and are passed down to the push sites as
+    /// five scalars rather than bundled into a context object; see `Move.mk`.
     ///
-    pub def legalMoves(b: Board[r], moves: MoveList[r2]): Unit \ r + r2 = {
+    /// # Why this returns `Bool` where the original returns `Unit` (round 6)
+    ///
+    /// It hands back `checkers != 0`, which is *exactly* what `isCheck` recomputes.
+    /// `legalMoves` does not mutate the board between computing `checkers` and
+    /// returning, so a caller that needs both — and `GameEncoder.decodeLoop` calls
+    /// `isCheck` once per ply, immediately after `legalMoves` — was paying for
+    /// `attacksTo(getKing(turn), !turn)` twice on an unchanged position.
+    /// Instrumented over the corpus that is 1.00 redundant call per ply, 17.8-23.4%
+    /// of all `attacksTo` calls and exactly 12.0% of every magic-bitboard lookup
+    /// decode performs. On the Scala reference deleting it is worth almost nothing
+    /// (0.989x/0.998x/1.000x — the table line is still hot); in Flix it is worth
+    /// more, because it also deletes a trampolined `Def$isCheck` and a trampolined
+    /// `Def$attacksToOcc` call per ply.
+    ///
+    /// Round 4 considered this (as "P6") and declined it, fearing "a `Value$` box on
+    /// every `legalMoves` call". That fear was unfounded and `javap` disproves it: a
+    /// `Bool`-returning Flix def ends `getstatic dev/flix/runtime/Value$.TRUE` /
+    /// `getstatic ...Value$.FALSE` / `areturn`, and allocates nothing. A `Unit`
+    /// return is the same deal with `Value$.UNIT`, so this costs no allocation at
+    /// the seven call sites that `discard` it.
+    ///
+    /// The alternative — a separate `legalMovesChecked` — was rejected because it
+    /// duplicates this twenty-line body, and delegating one to the other would put a
+    /// fresh trampolined call on the encode and perft hot paths.
+    ///
+    pub def legalMoves(b: Board[r], moves: MoveList[r2]): Bool \ r + r2 = {
         MoveList.clear(moves);
-        let ctx = moveCtx(b);
-        if (b->epSquare != 0) genEnPassant(b, ctx, moves) else ();
+        if (b->epSquare != 0) genEnPassant(b, moves) else ();
 
         let king = getKing(b, b->turn);
         let checkers = attacksTo(b, king, not b->turn);
         if (checkers == 0i64) {
             let target = Bits.bnotL(us(b));
-            genNonKing(b, ctx, target, moves);
-            genSafeKing(b, ctx, king, target, moves);
-            genCastling(b, ctx, king, moves)
+            genNonKing(b, target, moves);
+            genSafeKing(b, king, target, moves);
+            genCastling(b, king, moves)
         } else
-            genEvasions(b, ctx, king, checkers, moves);
+            genEvasions(b, king, checkers, moves);
 
         let blockers = sliderBlockers(b, king);
 
@@ -638,16 +693,8 @@ mod Board {
             MoveList.retain(moves, m -> isSafe(b, king, m, blockers))
         else
             ();
-        ()
+        checkers != 0i64
     }
-
-    ///
-    /// The `MoveCtx` for the current position: `Move.set` reads exactly `board.turn`,
-    /// `board.pawns` and `board.them()`, plus the two static tables.
-    ///
-    @Inline
-    def moveCtx(b: Board[r]): MoveCtx \ r =
-        MoveCtx.mk(b->tables, b->psqt, b->turn, b->pawns, them(b))
 
     ///
     /// Scala `def hasLegalEnPassant(): Boolean`.
@@ -659,7 +706,7 @@ mod Board {
         if (b->epSquare == 0) false
         else region rc {
             let moves = MoveList.mk(rc, 2);
-            genEnPassant(b, moveCtx(b), moves);
+            genEnPassant(b, moves);
             let king = getKing(b, b->turn);
             let blockers = sliderBlockers(b, king);
             MoveList.exists(moves, m -> isSafe(b, king, m, blockers))
@@ -670,59 +717,59 @@ mod Board {
     /// then knights, bishops, rooks, queens — in that order, and within each piece
     /// type from the lowest square upwards.
     ///
-    def genNonKing(b: Board[r], ctx: MoveCtx, mask: Int64, moves: MoveList[r2]): Unit \ r + r2 = {
-        genPawn(b, ctx, mask, moves);
-        genKnights(b, ctx, mask, moves, Bits.bandL(us(b), b->knights));
-        genBishops(b, ctx, mask, moves, Bits.bandL(us(b), b->bishops));
-        genRooks(b, ctx, mask, moves, Bits.bandL(us(b), b->rooks));
-        genQueens(b, ctx, mask, moves, Bits.bandL(us(b), b->queens));
+    def genNonKing(b: Board[r], mask: Int64, moves: MoveList[r2]): Unit \ r + r2 = {
+        genPawn(b, mask, moves);
+        genKnights(b, mask, moves, Bits.bandL(us(b), b->knights));
+        genBishops(b, mask, moves, Bits.bandL(us(b), b->bishops));
+        genRooks(b, mask, moves, Bits.bandL(us(b), b->rooks));
+        genQueens(b, mask, moves, Bits.bandL(us(b), b->queens));
         ()
     }
 
-    def genKnights(b: Board[r], ctx: MoveCtx, mask: Int64, moves: MoveList[r2], pieces: Int64): Unit \ r + r2 =
+    def genKnights(b: Board[r], mask: Int64, moves: MoveList[r2], pieces: Int64): Unit \ r + r2 =
         if (pieces == 0i64) ()
         else {
             let fromSq = Bitboard.lsbAt(pieces);
             let targets = Bits.bandL(Bitboard.knightAttacks(b->tables, fromSq), mask);
-            pushTargets(b, ctx, Role.Knight, fromSq, moves, targets);
-            genKnights(b, ctx, mask, moves, Bits.bandL(pieces, pieces - 1i64))
+            pushTargets(b, Role.Knight, fromSq, moves, targets);
+            genKnights(b, mask, moves, Bits.bandL(pieces, pieces - 1i64))
         }
 
-    def genBishops(b: Board[r], ctx: MoveCtx, mask: Int64, moves: MoveList[r2], pieces: Int64): Unit \ r + r2 =
+    def genBishops(b: Board[r], mask: Int64, moves: MoveList[r2], pieces: Int64): Unit \ r + r2 =
         if (pieces == 0i64) ()
         else {
             let fromSq = Bitboard.lsbAt(pieces);
             let targets = Bits.bandL(Bitboard.bishopAttacks(b->tables, fromSq, b->occupied), mask);
-            pushTargets(b, ctx, Role.Bishop, fromSq, moves, targets);
-            genBishops(b, ctx, mask, moves, Bits.bandL(pieces, pieces - 1i64))
+            pushTargets(b, Role.Bishop, fromSq, moves, targets);
+            genBishops(b, mask, moves, Bits.bandL(pieces, pieces - 1i64))
         }
 
-    def genRooks(b: Board[r], ctx: MoveCtx, mask: Int64, moves: MoveList[r2], pieces: Int64): Unit \ r + r2 =
+    def genRooks(b: Board[r], mask: Int64, moves: MoveList[r2], pieces: Int64): Unit \ r + r2 =
         if (pieces == 0i64) ()
         else {
             let fromSq = Bitboard.lsbAt(pieces);
             let targets = Bits.bandL(Bitboard.rookAttacks(b->tables, fromSq, b->occupied), mask);
-            pushTargets(b, ctx, Role.Rook, fromSq, moves, targets);
-            genRooks(b, ctx, mask, moves, Bits.bandL(pieces, pieces - 1i64))
+            pushTargets(b, Role.Rook, fromSq, moves, targets);
+            genRooks(b, mask, moves, Bits.bandL(pieces, pieces - 1i64))
         }
 
-    def genQueens(b: Board[r], ctx: MoveCtx, mask: Int64, moves: MoveList[r2], pieces: Int64): Unit \ r + r2 =
+    def genQueens(b: Board[r], mask: Int64, moves: MoveList[r2], pieces: Int64): Unit \ r + r2 =
         if (pieces == 0i64) ()
         else {
             let fromSq = Bitboard.lsbAt(pieces);
             let targets = Bits.bandL(Bitboard.queenAttacks(b->tables, fromSq, b->occupied), mask);
-            pushTargets(b, ctx, Role.Queen, fromSq, moves, targets);
-            genQueens(b, ctx, mask, moves, Bits.bandL(pieces, pieces - 1i64))
+            pushTargets(b, Role.Queen, fromSq, moves, targets);
+            genQueens(b, mask, moves, Bits.bandL(pieces, pieces - 1i64))
         }
 
     /// The inner `while targets != 0` loop shared by the four non-pawn generators.
-    def pushTargets(b: Board[r], ctx: MoveCtx, role: Role, fromSq: Int32,
+    def pushTargets(b: Board[r], role: Role, fromSq: Int32,
                     moves: MoveList[r2], targets: Int64): Unit \ r + r2 =
         if (targets == 0i64) ()
         else {
             let toSq = Bitboard.lsbAt(targets);
-            MoveList.pushNormal(moves, ctx, role, fromSq, isOccupied(b, toSq), toSq);
-            pushTargets(b, ctx, role, fromSq, moves, Bits.bandL(targets, targets - 1i64))
+            MoveList.pushNormal(moves, b->tables, b->psqt, b->turn, b->pawns, them(b), role, fromSq, isOccupied(b, toSq), toSq);
+            pushTargets(b, role, fromSq, moves, Bits.bandL(targets, targets - 1i64))
         }
 
     ///
@@ -733,18 +780,18 @@ mod Board {
     /// original does, and `genEvasions` compensates by masking out slider rays.
     ///
     @Inline
-    def genSafeKing(b: Board[r], ctx: MoveCtx, king: Int32, mask: Int64, moves: MoveList[r2]): Unit \ r + r2 =
-        genSafeKingLoop(b, ctx, king, moves, Bits.bandL(Bitboard.kingAttacks(b->tables, king), mask))
+    def genSafeKing(b: Board[r], king: Int32, mask: Int64, moves: MoveList[r2]): Unit \ r + r2 =
+        genSafeKingLoop(b, king, moves, Bits.bandL(Bitboard.kingAttacks(b->tables, king), mask))
 
-    def genSafeKingLoop(b: Board[r], ctx: MoveCtx, king: Int32,
+    def genSafeKingLoop(b: Board[r], king: Int32,
                         moves: MoveList[r2], targets: Int64): Unit \ r + r2 =
         if (targets == 0i64) ()
         else {
             let toSq = Bitboard.lsbAt(targets);
             if (attacksTo(b, toSq, not b->turn) == 0i64)
-                MoveList.pushNormal(moves, ctx, Role.King, king, isOccupied(b, toSq), toSq)
+                MoveList.pushNormal(moves, b->tables, b->psqt, b->turn, b->pawns, them(b), Role.King, king, isOccupied(b, toSq), toSq)
             else ();
-            genSafeKingLoop(b, ctx, king, moves, Bits.bandL(targets, targets - 1i64))
+            genSafeKingLoop(b, king, moves, Bits.bandL(targets, targets - 1i64))
         }
 
     ///
@@ -755,17 +802,17 @@ mod Board {
     /// along a checking line. `checkers & (bishops ^ rooks ^ queens)` is the Scala
     /// expression verbatim — a triple XOR, not an OR.
     ///
-    def genEvasions(b: Board[r], ctx: MoveCtx, king: Int32, checkers: Int64,
+    def genEvasions(b: Board[r], king: Int32, checkers: Int64,
                     moves: MoveList[r2]): Unit \ r + r2 = {
         let sliders = Bits.bandL(checkers, Bits.bxorL(Bits.bxorL(b->bishops, b->rooks), b->queens));
         let attacked = evasionRays(b, king, sliders, 0i64);
 
-        genSafeKing(b, ctx, king, Bits.bandL(Bits.bnotL(us(b)), Bits.bnotL(attacked)), moves);
+        genSafeKing(b, king, Bits.bandL(Bits.bnotL(us(b)), Bits.bnotL(attacked)), moves);
 
         if (checkers != 0i64 and not Bitboard.moreThanOne(checkers)) {
             let checker = Bitboard.lsbAt(checkers);
             let target = Bits.borL(Bitboard.between(b->tables, king, checker), checkers);
-            genNonKing(b, ctx, target, moves)
+            genNonKing(b, target, moves)
         } else
             ();
         ()
@@ -788,8 +835,8 @@ mod Board {
     /// `singleMoves` — masking early would lose double pushes whose intermediate
     /// square is outside the mask.
     ///
-    def genPawn(b: Board[r], ctx: MoveCtx, mask: Int64, moves: MoveList[r2]): Unit \ r + r2 = {
-        genPawnCaptures(b, ctx, mask, moves, Bits.bandL(us(b), b->pawns));
+    def genPawn(b: Board[r], mask: Int64, moves: MoveList[r2]): Unit \ r + r2 = {
+        genPawnCaptures(b, mask, moves, Bits.bandL(us(b), b->pawns));
 
         let free = Bits.bnotL(b->occupied);
         let pushed =
@@ -801,12 +848,12 @@ mod Board {
                 Bits.bandL(free, if (b->turn) Bits.shlL(singleMoves, 8) else Bits.ushrL(singleMoves, 8)),
                 Bitboard.ranks(b->tables, if (b->turn) 3 else 4));
 
-        genPawnPushes(b, ctx, moves, Bits.bandL(singleMoves, mask));
-        genPawnDoubles(b, ctx, moves, Bits.bandL(doubleMoves, mask));
+        genPawnPushes(b, moves, Bits.bandL(singleMoves, mask));
+        genPawnDoubles(b, moves, Bits.bandL(doubleMoves, mask));
         ()
     }
 
-    def genPawnCaptures(b: Board[r], ctx: MoveCtx, mask: Int64,
+    def genPawnCaptures(b: Board[r], mask: Int64,
                         moves: MoveList[r2], capturers: Int64): Unit \ r + r2 =
         if (capturers == 0i64) ()
         else {
@@ -815,35 +862,35 @@ mod Board {
                 Bits.bandL(
                     Bits.bandL(Bitboard.pawnAttacks(b->tables, b->turn, fromSq), them(b)),
                     mask);
-            genPawnCaptureTargets(b, ctx, fromSq, moves, targets);
-            genPawnCaptures(b, ctx, mask, moves, Bits.bandL(capturers, capturers - 1i64))
+            genPawnCaptureTargets(b, fromSq, moves, targets);
+            genPawnCaptures(b, mask, moves, Bits.bandL(capturers, capturers - 1i64))
         }
 
-    def genPawnCaptureTargets(b: Board[r], ctx: MoveCtx, fromSq: Int32,
+    def genPawnCaptureTargets(b: Board[r], fromSq: Int32,
                               moves: MoveList[r2], targets: Int64): Unit \ r + r2 =
         if (targets == 0i64) ()
         else {
             let toSq = Bitboard.lsbAt(targets);
-            addPawnMoves(b, ctx, fromSq, true, toSq, moves);
-            genPawnCaptureTargets(b, ctx, fromSq, moves, Bits.bandL(targets, targets - 1i64))
+            addPawnMoves(b, fromSq, true, toSq, moves);
+            genPawnCaptureTargets(b, fromSq, moves, Bits.bandL(targets, targets - 1i64))
         }
 
-    def genPawnPushes(b: Board[r], ctx: MoveCtx, moves: MoveList[r2], singleMoves: Int64): Unit \ r + r2 =
+    def genPawnPushes(b: Board[r], moves: MoveList[r2], singleMoves: Int64): Unit \ r + r2 =
         if (singleMoves == 0i64) ()
         else {
             let toSq = Bitboard.lsbAt(singleMoves);
             let fromSq = toSq + (if (b->turn) -8 else 8);
-            addPawnMoves(b, ctx, fromSq, false, toSq, moves);
-            genPawnPushes(b, ctx, moves, Bits.bandL(singleMoves, singleMoves - 1i64))
+            addPawnMoves(b, fromSq, false, toSq, moves);
+            genPawnPushes(b, moves, Bits.bandL(singleMoves, singleMoves - 1i64))
         }
 
-    def genPawnDoubles(b: Board[r], ctx: MoveCtx, moves: MoveList[r2], doubleMoves: Int64): Unit \ r + r2 =
+    def genPawnDoubles(b: Board[r], moves: MoveList[r2], doubleMoves: Int64): Unit \ r + r2 =
         if (doubleMoves == 0i64) ()
         else {
             let toSq = Bitboard.lsbAt(doubleMoves);
             let fromSq = toSq + (if (b->turn) -16 else 16);
-            MoveList.pushNormal(moves, ctx, Role.Pawn, fromSq, false, toSq);
-            genPawnDoubles(b, ctx, moves, Bits.bandL(doubleMoves, doubleMoves - 1i64))
+            MoveList.pushNormal(moves, b->tables, b->psqt, b->turn, b->pawns, them(b), Role.Pawn, fromSq, false, toSq);
+            genPawnDoubles(b, moves, Bits.bandL(doubleMoves, doubleMoves - 1i64))
         }
 
     ///
@@ -862,22 +909,22 @@ mod Board {
     /// the arm taken only on the last rank. Splitting leaves the hot path small
     /// enough for HotSpot to inline into `genPawnPushes`/`genPawnCaptureTargets`
     /// and moves the bulk behind a branch that is almost never taken.
-    def addPawnMoves(b: Board[r], ctx: MoveCtx, fromSq: Int32, capture: Bool,
+    def addPawnMoves(b: Board[r], fromSq: Int32, capture: Bool,
                      toSq: Int32, moves: MoveList[r2]): Unit \ r + r2 =
         if (Square.rank(toSq) == (if (b->turn) 7 else 0))
-            addPromotions(ctx, fromSq, capture, toSq, moves)
+            addPromotions(b, fromSq, capture, toSq, moves)
         else
-            MoveList.pushNormal(moves, ctx, Role.Pawn, fromSq, capture, toSq)
+            MoveList.pushNormal(moves, b->tables, b->psqt, b->turn, b->pawns, them(b), Role.Pawn, fromSq, capture, toSq)
 
     /// The four promotions, in the order the `MoveList` must hold them. Trailing
     /// `()` for the reason documented above `Board.put`: without it the last call
     /// becomes a heap continuation returned to the trampoline.
-    def addPromotions(ctx: MoveCtx, fromSq: Int32, capture: Bool,
-                      toSq: Int32, moves: MoveList[r2]): Unit \ r2 = {
-        MoveList.pushPromotion(moves, ctx, fromSq, capture, toSq, Role.Queen);
-        MoveList.pushPromotion(moves, ctx, fromSq, capture, toSq, Role.Knight);
-        MoveList.pushPromotion(moves, ctx, fromSq, capture, toSq, Role.Rook);
-        MoveList.pushPromotion(moves, ctx, fromSq, capture, toSq, Role.Bishop);
+    def addPromotions(b: Board[r], fromSq: Int32, capture: Bool,
+                      toSq: Int32, moves: MoveList[r2]): Unit \ r + r2 = {
+        MoveList.pushPromotion(moves, b->tables, b->psqt, b->turn, b->pawns, them(b), fromSq, capture, toSq, Role.Queen);
+        MoveList.pushPromotion(moves, b->tables, b->psqt, b->turn, b->pawns, them(b), fromSq, capture, toSq, Role.Knight);
+        MoveList.pushPromotion(moves, b->tables, b->psqt, b->turn, b->pawns, them(b), fromSq, capture, toSq, Role.Rook);
+        MoveList.pushPromotion(moves, b->tables, b->psqt, b->turn, b->pawns, them(b), fromSq, capture, toSq, Role.Bishop);
         ()
     }
 
@@ -888,18 +935,18 @@ mod Board {
     /// would attack is exactly a pawn that can capture en passant.
     ///
     @Inline
-    def genEnPassant(b: Board[r], ctx: MoveCtx, moves: MoveList[r2]): Unit \ r + r2 =
-        genEnPassantLoop(b, ctx, moves,
+    def genEnPassant(b: Board[r], moves: MoveList[r2]): Unit \ r + r2 =
+        genEnPassantLoop(b, moves,
             Bits.bandL(
                 Bits.bandL(us(b), b->pawns),
                 Bitboard.pawnAttacks(b->tables, not b->turn, b->epSquare)))
 
-    def genEnPassantLoop(b: Board[r], ctx: MoveCtx, moves: MoveList[r2], pawns: Int64): Unit \ r + r2 =
+    def genEnPassantLoop(b: Board[r], moves: MoveList[r2], pawns: Int64): Unit \ r + r2 =
         if (pawns == 0i64) ()
         else {
             let pawn = Bitboard.lsbAt(pawns);
-            MoveList.pushEnPassant(moves, ctx, pawn, b->epSquare);
-            genEnPassantLoop(b, ctx, moves, Bits.bandL(pawns, pawns - 1i64))
+            MoveList.pushEnPassant(moves, b->tables, b->psqt, b->turn, b->pawns, them(b), pawn, b->epSquare);
+            genEnPassantLoop(b, moves, Bits.bandL(pawns, pawns - 1i64))
         }
 
     ///
@@ -911,11 +958,11 @@ mod Board {
     /// re-test entirely, which is `false`.
     ///
     @Inline
-    def genCastling(b: Board[r], ctx: MoveCtx, king: Int32, moves: MoveList[r2]): Unit \ r + r2 =
-        genCastlingLoop(b, ctx, king, moves,
+    def genCastling(b: Board[r], king: Int32, moves: MoveList[r2]): Unit \ r + r2 =
+        genCastlingLoop(b, king, moves,
             Bits.bandL(b->castlingRights, Bitboard.ranks(b->tables, if (b->turn) 0 else 7)))
 
-    def genCastlingLoop(b: Board[r], ctx: MoveCtx, king: Int32,
+    def genCastlingLoop(b: Board[r], king: Int32,
                         moves: MoveList[r2], rooks: Int64): Unit \ r + r2 =
         if (rooks == 0i64) ()
         else {
@@ -927,10 +974,10 @@ mod Board {
                     Bits.borL(
                         Bits.borL(Bitboard.between(b->tables, king, kingTo), Bits.bit(kingTo)),
                         Bits.bit(king));
-                if (kingPathIsSafe(b, king, kingPath)) MoveList.pushCastle(moves, ctx, king, rook)
+                if (kingPathIsSafe(b, king, kingPath)) MoveList.pushCastle(moves, b->tables, b->psqt, b->turn, b->pawns, them(b), king, rook)
                 else ()
             } else ();
-            genCastlingLoop(b, ctx, king, moves, Bits.bandL(rooks, rooks - 1i64))
+            genCastlingLoop(b, king, moves, Bits.bandL(rooks, rooks - 1i64))
         }
 
     ///

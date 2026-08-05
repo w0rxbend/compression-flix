@@ -107,33 +107,42 @@ jar.**
 
 ## How it performs
 
-The port started at a uniform ~5x slower than the original. After an optimisation
-campaign gated on byte-identical output, it is **ahead on game encode and on move
-generation, and still behind on everything else**:
+The port began at a uniform 2.7-5.4x slower than the original. After two
+optimisation campaigns, every change gated on byte-identical output, **10 of the
+12 throughput rows now beat the original**:
 
-| | before | after |
+| | at the start | now |
 |---|---|---|
-| game encode | 5.08-5.30x slower | **0.818-0.877x — faster** |
-| game encode allocation | 24.6-26.9x more | **0.336-0.468x — less** |
-| perft depth-4, 4.1e9 nodes | 494 s vs 161 s | **79 s vs 160.5 s — 2.03x faster** |
-| game decode | 4.72-5.38x slower | 1.017-1.109x slower |
-| clock encode | 4.24-4.43x slower | 1.266-1.349x slower |
-| clock decode | 2.75-3.98x slower | 1.149-1.307x slower |
-| cold start | 172 ms vs 69 ms | 76.2 ms vs 68.6 ms |
+| game encode | 5.08-5.30x slower | **0.774-0.915x — faster** |
+| game decode | 4.72-5.38x slower | **0.796-0.953x — faster** |
+| clock decode | 2.75-3.98x slower | **0.768-0.786x — faster** |
+| cold start | 172 ms vs 69 ms | **37.7 ms vs 67.9 ms — 1.8x faster** |
+| perft depth-4, 4.1e9 nodes | 494 s vs 161 s | **80 s vs 161 s — 2.02x faster** |
+| game encode allocation | 24.6-26.9x more | **0.164-0.296x — 3-6x less** |
+| clock encode | 4.24-4.43x slower | 1.168-1.269x slower |
+| clock encode allocation | 6.5-10.1x more | 1.281-1.529x more |
+| game decode allocation | 78.9-94.9x more | 0.810-1.518x |
 
-It does **not** beat the original outright. The Scala side was never given an
-equivalent optimisation pass, so the defensible claim is "faster than the
-reference implementation it copies, on some paths" — not that Flix is faster
-than Scala.
+It does **not** beat the original on every row, and the eight that still lose are
+understood rather than open — six are the fixed cost of Flix's `@Export` boundary
+(a flat +72 B/op per call, accounted for to the byte), and two are one `long[256]`
+scratch buffer per decode call that only a `ThreadLocal` pool would remove, at the
+price of a documented thread-safety property.
 
-Most of the gain was not algorithmic. Flix's `Int64.numberOfTrailingZeros` is a
-recursive per-bit scan that compiles to a heap continuation, where
-`java.lang.Long`'s is a pure call and a JIT intrinsic. Beyond that it was the
-calling convention rather than the data structures: a body in tail position
-allocates a continuation object, a single-case enum destructure emits every field
-plus a dead `MatchError` block, and named-argument stdlib functions allocate a
-record. [docs/PORTING-NOTES.md](docs/PORTING-NOTES.md) records each mechanism with
-the bytecode that demonstrates it — useful to anyone writing a Flix hot loop.
+The Scala side was never given an equivalent optimisation pass, so the defensible
+claim is "faster than the reference implementation it copies, on most paths" —
+not that Flix is faster than Scala.
+
+Most of the gain was not algorithmic but a matter of what Flix's calling
+convention emits. `Int64.numberOfTrailingZeros` is a recursive per-bit scan
+compiling to a heap continuation where `java.lang.Long`'s is a JIT intrinsic; a
+body in tail position allocates a continuation object; mutual recursion is the one
+tail-call shape Flix cannot compile to a `goto`; a single-case enum destructure
+emits every field plus a dead `MatchError` block. The exceptions are the Huffman
+decoder, which became a 9-bit lookup table, and SAN decoding into a reusable
+buffer. [docs/PORTING-NOTES.md](docs/PORTING-NOTES.md) records each mechanism with
+the bytecode that demonstrates it — the most transferable part of this work for
+anyone writing a Flix hot loop.
 
 Full tables, methodology, hardware and per-row caveats:
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md).

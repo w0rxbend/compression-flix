@@ -81,7 +81,7 @@ mod TestHuffman {
 
     /// `HuffmanTable`'s decoding tree.
     def rootOf(t: HuffmanTable): Node =
-        let HuffmanTable.HuffmanTable(_, root) = t;
+        let HuffmanTable.HuffmanTable(_, root, _) = t;
         root
 
     // -------------------------------------------------------------- table shape
