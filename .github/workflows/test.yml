@@ -98,7 +98,7 @@ jobs:
           fi
           echo "OK: $(unzip -l "$JAR" | tail -1)"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: flix-release-jar
           path: artifact/*-release.jar
